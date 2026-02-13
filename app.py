@@ -666,36 +666,13 @@ def main() -> None:
     next_day = next_business_day(as_of)
     render_header(next_day)
 
-    with st.sidebar:
-        st.subheader("Trade Constraints")
+    st.subheader("Trade Setup")
+    st.caption("All filters are visible here for better mobile usability.")
+
+    risk_col, portfolio_col = st.columns(2)
+    with risk_col:
         risk_level = st.selectbox("Risk Level", ["conservative", "moderate"], index=0)
-
-        tickers = st.multiselect(
-            "Blue-Chip Tech Universe",
-            BLUE_CHIP_TECH,
-            default=["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL"],
-        )
-
-        allowed_strategy_labels = st.multiselect(
-            "Allowed Strategies",
-            list(STRATEGY_LABELS.values()),
-            default=[STRATEGY_LABELS["covered_call"], STRATEGY_LABELS["cash_secured_put"]],
-        )
-
-        strategy_reverse = {v: k for k, v in STRATEGY_LABELS.items()}
-        allowed_strategies = [strategy_reverse[label] for label in allowed_strategy_labels]
-
-        st.markdown("Shares owned per ticker (for covered calls)")
-        shares_default = pd.DataFrame({"Ticker": tickers, "SharesOwned": [0] * len(tickers)})
-        shares_df = st.data_editor(
-            shares_default,
-            hide_index=True,
-            use_container_width=True,
-            num_rows="fixed",
-        )
-        shares_map = {row["Ticker"]: int(row["SharesOwned"]) for _, row in shares_df.iterrows()}
-
-        st.subheader("Portfolio Risk Sizing")
+    with portfolio_col:
         account_size = st.number_input(
             "Portfolio Size ($)",
             min_value=5000.0,
@@ -703,9 +680,37 @@ def main() -> None:
             value=150000.0,
             step=1000.0,
         )
-        default_risk = 1.0 if risk_level == "conservative" else 2.0
-        max_risk_per_trade_pct = st.slider("Max Risk Per Trade (%)", 0.25, 5.0, float(default_risk), 0.25)
 
+    tickers = st.multiselect(
+        "Blue-Chip Tech Universe",
+        BLUE_CHIP_TECH,
+        default=["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL"],
+    )
+
+    allowed_strategy_labels = st.multiselect(
+        "Allowed Strategies",
+        list(STRATEGY_LABELS.values()),
+        default=[STRATEGY_LABELS["covered_call"], STRATEGY_LABELS["cash_secured_put"]],
+    )
+
+    strategy_reverse = {v: k for k, v in STRATEGY_LABELS.items()}
+    allowed_strategies = [strategy_reverse[label] for label in allowed_strategy_labels]
+
+    st.markdown("Shares owned per ticker (for covered calls)")
+    shares_default = pd.DataFrame({"Ticker": tickers, "SharesOwned": [0] * len(tickers)})
+    shares_df = st.data_editor(
+        shares_default,
+        hide_index=True,
+        use_container_width=True,
+        num_rows="fixed",
+    )
+    shares_map = {row["Ticker"]: int(row["SharesOwned"]) for _, row in shares_df.iterrows()}
+
+    default_risk = 1.0 if risk_level == "conservative" else 2.0
+    risk_size_col, csp_col, call_col = st.columns(3)
+    with risk_size_col:
+        max_risk_per_trade_pct = st.slider("Max Risk Per Trade (%)", 0.25, 5.0, float(default_risk), 0.25)
+    with csp_col:
         cash_per_trade = st.number_input(
             "Cash reserved per CSP trade ($)",
             min_value=1000.0,
@@ -713,7 +718,7 @@ def main() -> None:
             value=25000.0,
             step=500.0,
         )
-
+    with call_col:
         max_premium_budget = st.number_input(
             "Max premium budget for naked calls ($)",
             min_value=100.0,
@@ -722,10 +727,13 @@ def main() -> None:
             step=50.0,
         )
 
-        st.subheader("Earnings Filter")
+    st.markdown("Earnings Filter")
+    earn_col1, earn_col2 = st.columns(2)
+    with earn_col1:
         use_earnings_filter = st.checkbox("Avoid trades around earnings", value=True)
-        earnings_buffer_days = st.slider("Earnings proximity window (days)", 3, 21, 7, 1)
         avoid_if_before_expiry = st.checkbox("Avoid if earnings falls before option expiry", value=True)
+    with earn_col2:
+        earnings_buffer_days = st.slider("Earnings proximity window (days)", 3, 21, 7, 1)
 
     if not tickers:
         st.info("Select at least one ticker.")
