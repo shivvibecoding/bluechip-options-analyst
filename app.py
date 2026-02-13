@@ -735,6 +735,83 @@ def generate_ai_memo(
         return fallback_ai_memo(idea, risk_level, next_day), "fallback"
 
 
+def fallback_chat_reply(user_text: str, context_tickers: List[str], risk_level: str) -> str:
+    base = (
+        f"Risk mode is {risk_level}. "
+        f"Current context tickers: {', '.join(context_tickers) if context_tickers else 'none'}."
+    )
+    if "explain" in user_text.lower():
+        return (
+            f"{base} Focus on three checks: thesis quality, event risk, and position sizing. "
+            "Use limit orders, pre-define max loss, and avoid forced trades when liquidity is poor."
+        )
+    if "entry" in user_text.lower() or "when" in user_text.lower():
+        return (
+            f"{base} Entry framework: confirm spread quality, no thesis-breaking news, and that spot remains within plan levels. "
+            "If one condition fails, skip."
+        )
+    return (
+        f"{base} Coaching guidance: keep trade size within your risk budget, avoid earnings-event exposure unless intentional, "
+        "and log your decision before placing orders."
+    )
+
+
+def call_openai_chat(
+    api_key: str,
+    model: str,
+    user_text: str,
+    risk_level: str,
+    context_tickers: List[str],
+    chat_history: List[Dict[str, str]],
+) -> str:
+    recent = chat_history[-10:]
+    history_text = "\n".join([f"{m['role']}: {m['content']}" for m in recent])
+    prompt = (
+        "You are a professional options coach assisting with conservative/moderate strategy decisions. "
+        "Be practical, concise, and risk-aware. Do not give guarantees.\n\n"
+        f"Risk mode: {risk_level}\n"
+        f"Context tickers: {', '.join(context_tickers) if context_tickers else 'none'}\n"
+        f"Recent chat:\n{history_text}\n\n"
+        f"User message: {user_text}\n\n"
+        "Respond with: (1) direct answer, (2) risk check, (3) next action."
+    )
+    payload = {"model": model, "input": prompt, "max_output_tokens": 500}
+    req = request.Request(
+        "https://api.openai.com/v1/responses",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+    try:
+        with request.urlopen(req, timeout=35) as resp:
+            body = resp.read().decode("utf-8")
+    except error.HTTPError as exc:
+        raise RuntimeError(f"OpenAI HTTP error: {exc.code}") from exc
+    except error.URLError as exc:
+        raise RuntimeError("OpenAI network error") from exc
+
+    data = json.loads(body)
+    if isinstance(data.get("output_text"), str) and data["output_text"].strip():
+        return data["output_text"].strip()
+
+    output = data.get("output", [])
+    chunks: List[str] = []
+    if isinstance(output, list):
+        for item in output:
+            content = item.get("content", [])
+            if isinstance(content, list):
+                for part in content:
+                    if part.get("type") == "output_text" and isinstance(part.get("text"), str):
+                        chunks.append(part["text"])
+    text = "\n".join(chunks).strip()
+    if text:
+        return text
+    raise RuntimeError("OpenAI chat response contained no text")
+
+
 def render_header(next_day: date) -> None:
     st.set_page_config(page_title="Blue-Chip Tech Options Analyst", layout="wide")
     st.markdown(
@@ -878,6 +955,13 @@ def main() -> None:
         st.session_state.analysis_payload = None
     if "ai_memos" not in st.session_state:
         st.session_state.ai_memos = {}
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = [
+            {
+                "role": "assistant",
+                "content": "I am your options coach bot. Ask about setups, entries, sizing, or risk controls.",
+            }
+        ]
 
     if st.button("Analyze and Generate Next-Day Trades", type="primary"):
         ideas: List[CandidateTrade] = []
@@ -1009,6 +1093,64 @@ def main() -> None:
             file_name=f"ai_memo_{selected_ticker}_{result_next_day}.md",
             mime="text/markdown",
         )
+
+    st.subheader("AI Chatbot")
+    chat_settings_col1, chat_settings_col2 = st.columns(2)
+    with chat_settings_col1:
+        chat_model = st.text_input("Chat Model", value="gpt-4.1-mini", key="chat_model")
+    with chat_settings_col2:
+        chat_api_key_input = st.text_input(
+            "OpenAI API Key for Chat (optional)",
+            type="password",
+            key="chat_api_key",
+        )
+
+    for msg in st.session_state.chat_history:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    user_chat = st.chat_input("Ask the coach bot about today's trade setups...")
+    if user_chat:
+        st.session_state.chat_history.append({"role": "user", "content": user_chat})
+        with st.chat_message("user"):
+            st.markdown(user_chat)
+
+        key = chat_api_key_input.strip()
+        if not key:
+            try:
+                key = str(st.secrets.get("OPENAI_API_KEY", "")).strip()
+            except Exception:
+                key = ""
+
+        context_tickers = [idea.ticker for idea in ideas]
+        if key:
+            try:
+                bot_reply = call_openai_chat(
+                    api_key=key,
+                    model=chat_model.strip() or "gpt-4.1-mini",
+                    user_text=user_chat,
+                    risk_level=result_risk_level,
+                    context_tickers=context_tickers,
+                    chat_history=st.session_state.chat_history,
+                )
+            except Exception:
+                bot_reply = fallback_chat_reply(user_chat, context_tickers, result_risk_level)
+        else:
+            bot_reply = fallback_chat_reply(user_chat, context_tickers, result_risk_level)
+
+        st.session_state.chat_history.append({"role": "assistant", "content": bot_reply})
+        with st.chat_message("assistant"):
+            st.markdown(bot_reply)
+
+    chat_export = "\n\n".join(
+        [f"{msg['role'].upper()}: {msg['content']}" for msg in st.session_state.chat_history]
+    )
+    st.download_button(
+        "Download Chat Transcript",
+        data=chat_export.encode("utf-8"),
+        file_name=f"coach_chat_{result_next_day}.txt",
+        mime="text/plain",
+    )
 
     st.subheader("Trade Ticket Export")
     st.dataframe(tickets_df, use_container_width=True, height=320)

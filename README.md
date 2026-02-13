@@ -38,6 +38,15 @@ Analyst-style app for generating **next-trading-day** options ideas on blue-chip
   - OpenAI mode (enter API key in app or set `OPENAI_API_KEY` in Streamlit secrets)
   - Offline fallback mode (built-in memo template)
 
+## AI chatbot feature
+
+- Interactive coach chatbot embedded in app results section
+- Understands current analyzed tickers and risk mode context
+- Works in two modes:
+  - OpenAI chat mode (API key in app field or `OPENAI_API_KEY` in secrets)
+  - Offline coaching fallback if no key/API error
+- Chat transcript can be downloaded as `.txt`
+
 ## Run
 
 ```bash
