@@ -553,34 +553,49 @@ def build_pdf_report_bytes(
     account_size: float,
     max_risk_per_trade_pct: float,
 ) -> bytes:
+    def safe_pdf_text(value: str) -> str:
+        # Core PDF fonts are latin-1; normalize dynamic content defensively.
+        if value is None:
+            return ""
+        text = str(value)
+        text = text.replace("\u2013", "-").replace("\u2014", "-").replace("\u2019", "'")
+        return text.encode("latin-1", errors="replace").decode("latin-1")
+
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=12)
     pdf.add_page()
     pdf.set_font("Helvetica", "B", 14)
-    pdf.cell(0, 10, "Blue-Chip Tech Options Trade Tickets", ln=1)
+    pdf.cell(0, 10, safe_pdf_text("Blue-Chip Tech Options Trade Tickets"), ln=1)
 
     pdf.set_font("Helvetica", size=10)
     pdf.multi_cell(
         0,
         6,
-        f"Trade Date: {next_day} | Risk Mode: {risk_level} | Account Size: ${account_size:,.0f} | Max Risk/Trade: {max_risk_per_trade_pct:.2f}%",
+        safe_pdf_text(
+            f"Trade Date: {next_day} | Risk Mode: {risk_level} | Account Size: ${account_size:,.0f} | Max Risk/Trade: {max_risk_per_trade_pct:.2f}%"
+        ),
     )
     pdf.ln(2)
 
     for idx, idea in enumerate(ideas, start=1):
         pdf.set_font("Helvetica", "B", 11)
-        pdf.cell(0, 7, f"{idx}. {idea.ticker} - {STRATEGY_LABELS[idea.strategy]}", ln=1)
+        pdf.cell(
+            0,
+            7,
+            safe_pdf_text(f"{idx}. {idea.ticker} - {STRATEGY_LABELS[idea.strategy]}"),
+            ln=1,
+        )
         pdf.set_font("Helvetica", size=10)
         pdf.multi_cell(
             0,
             6,
-            (
+            safe_pdf_text(
                 f"Contracts: {idea.contracts} | Expiry: {idea.expiry} | Strike: {idea.strike:.2f} | Mid: {idea.premium:.2f} | "
                 f"Capital: ${idea.capital_required:,.0f} | Est Max Loss: ${idea.est_max_loss_dollars:,.0f}"
             ),
         )
-        pdf.multi_cell(0, 6, f"Plan: {idea.trade_plan}")
-        pdf.multi_cell(0, 6, f"Rationale: {idea.rationale}")
+        pdf.multi_cell(0, 6, safe_pdf_text(f"Plan: {idea.trade_plan}"))
+        pdf.multi_cell(0, 6, safe_pdf_text(f"Rationale: {idea.rationale}"))
         pdf.ln(1)
 
     raw = pdf.output(dest="S")
@@ -736,19 +751,22 @@ def main() -> None:
             mime="text/csv",
         )
 
-        pdf_bytes = build_pdf_report_bytes(
-            ideas=ideas,
-            next_day=next_day,
-            risk_level=risk_level,
-            account_size=float(account_size),
-            max_risk_per_trade_pct=float(max_risk_per_trade_pct),
-        )
-        st.download_button(
-            "Download Trade Tickets (PDF)",
-            data=pdf_bytes,
-            file_name=f"next_day_trade_tickets_{next_day}.pdf",
-            mime="application/pdf",
-        )
+        try:
+            pdf_bytes = build_pdf_report_bytes(
+                ideas=ideas,
+                next_day=next_day,
+                risk_level=risk_level,
+                account_size=float(account_size),
+                max_risk_per_trade_pct=float(max_risk_per_trade_pct),
+            )
+            st.download_button(
+                "Download Trade Tickets (PDF)",
+                data=pdf_bytes,
+                file_name=f"next_day_trade_tickets_{next_day}.pdf",
+                mime="application/pdf",
+            )
+        except Exception as exc:
+            st.warning(f"PDF export is temporarily unavailable: {type(exc).__name__}. CSV export still works.")
 
         if skipped:
             st.caption("Skipped tickers and reasons")
