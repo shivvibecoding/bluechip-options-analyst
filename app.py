@@ -1,5 +1,6 @@
 import math
 import json
+import time
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Dict, List, Optional, Tuple
@@ -422,6 +423,44 @@ def apply_position_sizing(
     return None
 
 
+def fetch_history_with_retry(tk: yf.Ticker, ticker: str, retries: int = 3) -> pd.DataFrame:
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            hist = tk.history(period="6mo", interval="1d", auto_adjust=False)
+            if isinstance(hist, pd.DataFrame) and not hist.empty:
+                return hist
+            # Fallback path for flaky ticker endpoints.
+            fallback = yf.download(
+                ticker,
+                period="6mo",
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+            )
+            if isinstance(fallback, pd.DataFrame) and not fallback.empty:
+                return fallback
+        except Exception as exc:
+            last_exc = exc
+        time.sleep(0.35 * (attempt + 1))
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("No recent price history")
+
+
+def fetch_options_with_retry(tk: yf.Ticker, expiry: str, retries: int = 3):
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            return tk.option_chain(expiry)
+        except Exception as exc:
+            last_exc = exc
+            time.sleep(0.35 * (attempt + 1))
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Option chain unavailable")
+
+
 def build_trade_idea(
     ticker: str,
     risk_level: str,
@@ -438,12 +477,20 @@ def build_trade_idea(
 ) -> Tuple[Optional[CandidateTrade], str]:
     tk = yf.Ticker(ticker)
 
-    hist = tk.history(period="6mo", interval="1d", auto_adjust=False)
+    try:
+        hist = fetch_history_with_retry(tk, ticker=ticker, retries=3)
+    except Exception as exc:
+        return None, f"History fetch failed: {type(exc).__name__}: {str(exc)[:90]}"
     if hist.empty:
         return None, "No recent price history"
 
     sig = compute_signal_strength(hist)
-    expiry = pick_expiry(list(tk.options), risk_level, as_of)
+    try:
+        expiries = list(tk.options)
+    except Exception as exc:
+        return None, f"Expiry fetch failed: {type(exc).__name__}: {str(exc)[:90]}"
+
+    expiry = pick_expiry(expiries, risk_level, as_of)
     if not expiry:
         return None, "No valid option expiry"
 
@@ -459,7 +506,10 @@ def build_trade_idea(
             return None, f"Earnings filter: next earnings on {earnings_dt}"
         return None, "Earnings filter: near event window"
 
-    chain = tk.option_chain(expiry)
+    try:
+        chain = fetch_options_with_retry(tk, expiry=expiry, retries=3)
+    except Exception as exc:
+        return None, f"Option chain failed: {type(exc).__name__}: {str(exc)[:90]}"
     calls = chain.calls.copy()
     puts = chain.puts.copy()
 
@@ -988,8 +1038,8 @@ def main() -> None:
                     ideas.append(idea)
                 else:
                     skipped[ticker] = reason
-            except Exception:
-                skipped[ticker] = "Data retrieval or pricing error"
+            except Exception as exc:
+                skipped[ticker] = f"Unhandled error: {type(exc).__name__}: {str(exc)[:120]}"
 
             progress.progress((idx + 1) / len(tickers))
 
