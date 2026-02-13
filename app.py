@@ -606,6 +606,52 @@ def build_pdf_report_bytes(
 
 def render_header(next_day: date) -> None:
     st.set_page_config(page_title="Blue-Chip Tech Options Analyst", layout="wide")
+    st.markdown(
+        """
+        <style>
+        .block-container {
+            padding-top: 1rem;
+            padding-bottom: 1.25rem;
+            padding-left: 1rem;
+            padding-right: 1rem;
+            max-width: 1200px;
+        }
+        div[data-testid="stDataFrame"] {
+            overflow-x: auto;
+        }
+        @media (max-width: 768px) {
+            .block-container {
+                padding-top: 0.5rem;
+                padding-left: 0.6rem;
+                padding-right: 0.6rem;
+            }
+            h1 {
+                font-size: 1.35rem !important;
+                line-height: 1.25 !important;
+            }
+            h2, h3 {
+                font-size: 1.05rem !important;
+            }
+            p, label, div, span {
+                font-size: 0.92rem !important;
+            }
+            .stButton > button {
+                width: 100%;
+                min-height: 2.6rem;
+                font-size: 0.95rem;
+            }
+            div[data-testid="stSidebar"] .stButton > button {
+                width: 100%;
+            }
+            div[data-testid="stDataFrame"] iframe,
+            div[data-testid="stDataFrame"] > div {
+                min-width: 680px;
+            }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     st.title("Blue-Chip Tech Options Analyst")
     st.caption(
         f"Generates next-trading-day options ideas for {next_day} using blue-chip tech names and risk filters."
@@ -641,7 +687,12 @@ def main() -> None:
 
         st.markdown("Shares owned per ticker (for covered calls)")
         shares_default = pd.DataFrame({"Ticker": tickers, "SharesOwned": [0] * len(tickers)})
-        shares_df = st.data_editor(shares_default, hide_index=True, use_container_width=True)
+        shares_df = st.data_editor(
+            shares_default,
+            hide_index=True,
+            use_container_width=True,
+            num_rows="fixed",
+        )
         shares_map = {row["Ticker"]: int(row["SharesOwned"]) for _, row in shares_df.iterrows()}
 
         st.subheader("Portfolio Risk Sizing")
@@ -726,7 +777,7 @@ def main() -> None:
         tickets_df = build_trade_tickets_df(ideas, next_day)
 
         st.subheader("Next-Day Trade Ideas")
-        st.dataframe(ideas_df, use_container_width=True)
+        st.dataframe(ideas_df, use_container_width=True, height=320)
 
         for idea in ideas:
             with st.expander(f"{idea.ticker}: {STRATEGY_LABELS[idea.strategy]} ({idea.confidence} confidence)"):
@@ -741,7 +792,7 @@ def main() -> None:
                 st.write(f"Next Earnings: {idea.earnings_date}")
 
         st.subheader("Trade Ticket Export")
-        st.dataframe(tickets_df, use_container_width=True)
+        st.dataframe(tickets_df, use_container_width=True, height=320)
 
         csv_bytes = tickets_df.to_csv(index=False).encode("utf-8")
         st.download_button(
