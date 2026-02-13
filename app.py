@@ -5,6 +5,7 @@ import random
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlencode
 from urllib import error, request
 
 import numpy as np
@@ -486,6 +487,55 @@ def fetch_expiries_with_retry(tk: yf.Ticker, retries: int = 4) -> List[str]:
     raise RuntimeError("Expiry fetch failed")
 
 
+def http_get_json(url: str, headers: Dict[str, str], timeout: int = 25) -> Dict:
+    req = request.Request(url, headers=headers, method="GET")
+    with request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def fetch_tradier_expiries(symbol: str, tradier_token: str) -> List[str]:
+    base = "https://api.tradier.com/v1/markets/options/expirations"
+    query = urlencode({"symbol": symbol, "includeAllRoots": "true", "strikes": "false"})
+    headers = {"Authorization": f"Bearer {tradier_token}", "Accept": "application/json"}
+    data = http_get_json(f"{base}?{query}", headers=headers)
+    dates = data.get("expirations", {}).get("date", [])
+    if isinstance(dates, str):
+        return [dates]
+    if isinstance(dates, list):
+        return [str(d) for d in dates]
+    return []
+
+
+def fetch_tradier_chain(symbol: str, expiry: str, tradier_token: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    base = "https://api.tradier.com/v1/markets/options/chains"
+    query = urlencode({"symbol": symbol, "expiration": expiry, "greeks": "false"})
+    headers = {"Authorization": f"Bearer {tradier_token}", "Accept": "application/json"}
+    data = http_get_json(f"{base}?{query}", headers=headers)
+    options = data.get("options", {}).get("option", [])
+    if isinstance(options, dict):
+        options = [options]
+    if not isinstance(options, list):
+        options = []
+
+    rows = []
+    for item in options:
+        rows.append(
+            {
+                "strike": float(item.get("strike") or 0.0),
+                "bid": float(item.get("bid") or 0.0),
+                "ask": float(item.get("ask") or 0.0),
+                "lastPrice": float(item.get("last") or 0.0),
+                "type": str(item.get("option_type", "")).lower(),
+            }
+        )
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    calls = df[df["type"] == "call"][["strike", "bid", "ask", "lastPrice"]].copy()
+    puts = df[df["type"] == "put"][["strike", "bid", "ask", "lastPrice"]].copy()
+    return calls, puts
+
+
 def build_trade_idea(
     ticker: str,
     risk_level: str,
@@ -499,6 +549,8 @@ def build_trade_idea(
     use_earnings_filter: bool,
     earnings_buffer_days: int,
     avoid_if_before_expiry: bool,
+    options_provider: str,
+    tradier_token: str,
 ) -> Tuple[Optional[CandidateTrade], str]:
     tk = yf.Ticker(ticker)
 
@@ -510,15 +562,23 @@ def build_trade_idea(
         return None, "No recent price history"
 
     sig = compute_signal_strength(hist)
-    try:
-        expiries = fetch_expiries_with_retry(tk, retries=4)
-    except Exception as exc:
-        if is_rate_limit_error(exc):
-            return (
-                None,
-                "Expiry fetch rate-limited by Yahoo Finance. Wait 1-3 minutes, then retry with fewer tickers (2-4).",
-            )
-        return None, f"Expiry fetch failed: {type(exc).__name__}: {str(exc)[:90]}"
+    if options_provider == "tradier":
+        if not tradier_token.strip():
+            return None, "Tradier token missing. Add TRADIER_TOKEN secret or paste token in app."
+        try:
+            expiries = fetch_tradier_expiries(ticker, tradier_token.strip())
+        except Exception as exc:
+            return None, f"Tradier expiry fetch failed: {type(exc).__name__}: {str(exc)[:90]}"
+    else:
+        try:
+            expiries = fetch_expiries_with_retry(tk, retries=4)
+        except Exception as exc:
+            if is_rate_limit_error(exc):
+                return (
+                    None,
+                    "Expiry fetch rate-limited by Yahoo Finance. Switch provider to Tradier or retry later.",
+                )
+            return None, f"Expiry fetch failed: {type(exc).__name__}: {str(exc)[:90]}"
 
     expiry = pick_expiry(expiries, risk_level, as_of)
     if not expiry:
@@ -536,17 +596,26 @@ def build_trade_idea(
             return None, f"Earnings filter: next earnings on {earnings_dt}"
         return None, "Earnings filter: near event window"
 
-    try:
-        chain = fetch_options_with_retry(tk, expiry=expiry, retries=4)
-    except Exception as exc:
-        if is_rate_limit_error(exc):
-            return (
-                None,
-                "Option chain rate-limited by Yahoo Finance. Wait 1-3 minutes, then retry with fewer tickers (2-4).",
-            )
-        return None, f"Option chain failed: {type(exc).__name__}: {str(exc)[:90]}"
-    calls = chain.calls.copy()
-    puts = chain.puts.copy()
+    if options_provider == "tradier":
+        try:
+            calls, puts = fetch_tradier_chain(ticker, expiry, tradier_token.strip())
+        except Exception as exc:
+            return None, f"Tradier chain failed: {type(exc).__name__}: {str(exc)[:90]}"
+    else:
+        try:
+            chain = fetch_options_with_retry(tk, expiry=expiry, retries=4)
+        except Exception as exc:
+            if is_rate_limit_error(exc):
+                return (
+                    None,
+                    "Option chain rate-limited by Yahoo Finance. Switch provider to Tradier or retry later.",
+                )
+            return None, f"Option chain failed: {type(exc).__name__}: {str(exc)[:90]}"
+        calls = chain.calls.copy()
+        puts = chain.puts.copy()
+
+    if calls.empty and puts.empty:
+        return None, "Option chain data empty for selected expiry"
 
     candidates: List[CandidateTrade] = []
 
@@ -1028,6 +1097,29 @@ def main() -> None:
     with earn_col2:
         earnings_buffer_days = st.slider("Earnings proximity window (days)", 3, 21, 7, 1)
 
+    st.markdown("Options Data Provider")
+    provider_col1, provider_col2 = st.columns(2)
+    with provider_col1:
+        options_provider = st.selectbox(
+            "Provider",
+            ["yahoo", "tradier"],
+            index=0,
+            help="Use Tradier if Yahoo rate limits options expiries/chains on Streamlit Cloud.",
+        )
+    with provider_col2:
+        tradier_token_input = st.text_input(
+            "Tradier Token (optional)",
+            type="password",
+            help="Used when Provider is set to tradier. You can also store TRADIER_TOKEN in Streamlit secrets.",
+        )
+
+    tradier_token = tradier_token_input.strip()
+    if not tradier_token:
+        try:
+            tradier_token = str(st.secrets.get("TRADIER_TOKEN", "")).strip()
+        except Exception:
+            tradier_token = ""
+
     if not tickers:
         st.info("Select at least one ticker.")
         return
@@ -1069,6 +1161,8 @@ def main() -> None:
                     use_earnings_filter=use_earnings_filter,
                     earnings_buffer_days=int(earnings_buffer_days),
                     avoid_if_before_expiry=avoid_if_before_expiry,
+                    options_provider=options_provider,
+                    tradier_token=tradier_token,
                 )
                 if idea:
                     ideas.append(idea)

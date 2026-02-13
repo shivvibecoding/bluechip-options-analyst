@@ -68,6 +68,18 @@ Then open the local Streamlit URL shown in your terminal.
 - Cash reserved per CSP trade
 - Max premium budget for naked call
 - Earnings filter behavior and window size
+- Options data provider: `yahoo` or `tradier`
+
+## Handling Yahoo rate limits
+
+If Streamlit Cloud keeps showing Yahoo rate-limit errors for expiries/chains, switch provider to `tradier`.
+
+Set in Streamlit secrets:
+
+```toml
+TRADIER_TOKEN="your_tradier_token"
+OPENAI_API_KEY="sk-..."
+```
 
 ## Important
 
