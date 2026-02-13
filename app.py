@@ -1,7 +1,9 @@
 import math
+import json
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Dict, List, Optional, Tuple
+from urllib import error, request
 
 import numpy as np
 import pandas as pd
@@ -604,6 +606,135 @@ def build_pdf_report_bytes(
     return bytes(raw)
 
 
+def fallback_ai_memo(idea: CandidateTrade, risk_level: str, next_day: date) -> str:
+    return (
+        f"## AI Trade Committee Memo ({idea.ticker})\n\n"
+        f"### 1) Executive Summary\n"
+        f"- Trade date: {next_day}\n"
+        f"- Strategy: {STRATEGY_LABELS[idea.strategy]}\n"
+        f"- Risk mode selected: {risk_level}\n"
+        f"- Suggested size: {idea.contracts} contract(s)\n"
+        f"- Why this fit: {idea.rationale}\n\n"
+        f"### 2) Key Risks To Monitor\n"
+        f"- Event risk: next earnings date {idea.earnings_date}\n"
+        f"- Liquidity/slippage risk around open and close\n"
+        f"- Strategy-specific risk: {idea.max_risk}\n\n"
+        f"### 3) Pre-Market Checklist\n"
+        f"- Confirm spread quality and avoid wide bid/ask markets.\n"
+        f"- Validate no major overnight news changes the thesis.\n"
+        f"- Place limit order near model premium ({idea.premium:.2f}).\n\n"
+        f"### 4) Intraday Management Checklist\n"
+        f"- Reassess if spot breaks thesis level by >2% versus entry plan.\n"
+        f"- Avoid emotional averaging; follow the sizing limit.\n"
+        f"- Track position versus breakeven: {idea.breakeven}\n\n"
+        f"### 5) Beginner-Friendly Explanation\n"
+        f"This trade is chosen because it balances opportunity and controlled exposure under a {risk_level} profile. "
+        f"The plan is to follow the entry and risk rules strictly, not to predict every price move.\n\n"
+        f"### 6) Desk-Style Analyst Note\n"
+        f"Maintain discipline on execution quality, pre-defined sizing, and event risk gates. "
+        f"Only proceed if opening market conditions preserve expected reward/risk.\n"
+    )
+
+
+def call_openai_memo(
+    api_key: str,
+    model: str,
+    idea: CandidateTrade,
+    risk_level: str,
+    next_day: date,
+) -> str:
+    prompt = (
+        "You are a sell-side options strategist writing an internal trade committee memo.\\n"
+        "Write concise markdown with these headings exactly:\\n"
+        "1) Executive Summary\\n"
+        "2) Key Risks To Monitor\\n"
+        "3) Pre-Market Checklist\\n"
+        "4) Intraday Management Checklist\\n"
+        "5) Beginner-Friendly Explanation\\n"
+        "6) Desk-Style Analyst Note\\n\\n"
+        f"Trade date: {next_day}\\n"
+        f"Ticker: {idea.ticker}\\n"
+        f"Strategy: {STRATEGY_LABELS[idea.strategy]}\\n"
+        f"Risk level: {risk_level}\\n"
+        f"Contracts: {idea.contracts}\\n"
+        f"Spot: {idea.spot:.2f}\\n"
+        f"Strike: {idea.strike:.2f}\\n"
+        f"Mid premium: {idea.premium:.2f}\\n"
+        f"Breakeven: {idea.breakeven}\\n"
+        f"Estimated capital required: ${idea.capital_required:,.2f}\\n"
+        f"Estimated max loss: ${idea.est_max_loss_dollars:,.2f}\\n"
+        f"Rationale: {idea.rationale}\\n"
+        f"Plan: {idea.trade_plan}\\n"
+        f"Next earnings date: {idea.earnings_date}\\n\\n"
+        "Constraints: Keep it practical, no hype, no guarantees, and include concrete numeric trigger examples."
+    )
+
+    payload = {
+        "model": model,
+        "input": prompt,
+        "max_output_tokens": 900,
+    }
+    req = request.Request(
+        "https://api.openai.com/v1/responses",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+
+    try:
+        with request.urlopen(req, timeout=35) as resp:
+            body = resp.read().decode("utf-8")
+    except error.HTTPError as exc:
+        raise RuntimeError(f"OpenAI HTTP error: {exc.code}") from exc
+    except error.URLError as exc:
+        raise RuntimeError("OpenAI network error") from exc
+
+    data = json.loads(body)
+    if isinstance(data.get("output_text"), str) and data["output_text"].strip():
+        return data["output_text"].strip()
+
+    output = data.get("output", [])
+    chunks: List[str] = []
+    if isinstance(output, list):
+        for item in output:
+            content = item.get("content", [])
+            if isinstance(content, list):
+                for part in content:
+                    if part.get("type") == "output_text" and isinstance(part.get("text"), str):
+                        chunks.append(part["text"])
+    text = "\\n".join(chunks).strip()
+    if text:
+        return text
+    raise RuntimeError("OpenAI response contained no text")
+
+
+def generate_ai_memo(
+    idea: CandidateTrade,
+    risk_level: str,
+    next_day: date,
+    api_key: str,
+    model: str,
+) -> Tuple[str, str]:
+    key = api_key.strip()
+    if not key:
+        try:
+            key = str(st.secrets.get("OPENAI_API_KEY", "")).strip()
+        except Exception:
+            key = ""
+
+    if not key:
+        return fallback_ai_memo(idea, risk_level, next_day), "offline"
+
+    try:
+        memo = call_openai_memo(key, model, idea, risk_level, next_day)
+        return memo, "openai"
+    except Exception:
+        return fallback_ai_memo(idea, risk_level, next_day), "fallback"
+
+
 def render_header(next_day: date) -> None:
     st.set_page_config(page_title="Blue-Chip Tech Options Analyst", layout="wide")
     st.markdown(
@@ -743,6 +874,11 @@ def main() -> None:
         st.info("Select at least one strategy.")
         return
 
+    if "analysis_payload" not in st.session_state:
+        st.session_state.analysis_payload = None
+    if "ai_memos" not in st.session_state:
+        st.session_state.ai_memos = {}
+
     if st.button("Analyze and Generate Next-Day Trades", type="primary"):
         ideas: List[CandidateTrade] = []
         skipped: Dict[str, str] = {}
@@ -778,58 +914,133 @@ def main() -> None:
             if skipped:
                 st.write("Skip reasons:")
                 st.table(pd.DataFrame({"Ticker": list(skipped.keys()), "Reason": list(skipped.values())}))
+            st.session_state.analysis_payload = None
             return
 
         ideas = sorted(ideas, key=lambda x: x.score, reverse=True)
-        ideas_df = ideas_to_df(ideas)
-        tickets_df = build_trade_tickets_df(ideas, next_day)
+        st.session_state.analysis_payload = {
+            "ideas": ideas,
+            "skipped": skipped,
+            "risk_level": risk_level,
+            "account_size": float(account_size),
+            "max_risk_per_trade_pct": float(max_risk_per_trade_pct),
+            "next_day": str(next_day),
+        }
+        st.session_state.ai_memos = {}
 
-        st.subheader("Next-Day Trade Ideas")
-        st.dataframe(ideas_df, use_container_width=True, height=320)
+    payload = st.session_state.analysis_payload
+    if not payload:
+        return
 
-        for idea in ideas:
-            with st.expander(f"{idea.ticker}: {STRATEGY_LABELS[idea.strategy]} ({idea.confidence} confidence)"):
-                st.write(f"Rationale: {idea.rationale}")
-                st.write(f"Plan: {idea.trade_plan}")
-                st.write(f"Contracts: {idea.contracts}")
-                st.write(f"Estimated Capital Required: ${idea.capital_required:,.2f}")
-                st.write(f"Estimated Max Loss: ${idea.est_max_loss_dollars:,.2f}")
-                st.write(f"Max Profit: {idea.max_profit}")
-                st.write(f"Max Risk: {idea.max_risk}")
-                st.write(f"Breakeven: {idea.breakeven}")
-                st.write(f"Next Earnings: {idea.earnings_date}")
+    ideas = payload["ideas"]
+    skipped = payload["skipped"]
+    result_risk_level = payload["risk_level"]
+    result_account_size = payload["account_size"]
+    result_max_risk_pct = payload["max_risk_per_trade_pct"]
+    result_next_day = datetime.strptime(payload["next_day"], "%Y-%m-%d").date()
 
-        st.subheader("Trade Ticket Export")
-        st.dataframe(tickets_df, use_container_width=True, height=320)
+    ideas_df = ideas_to_df(ideas)
+    tickets_df = build_trade_tickets_df(ideas, result_next_day)
 
-        csv_bytes = tickets_df.to_csv(index=False).encode("utf-8")
+    st.subheader("Next-Day Trade Ideas")
+    st.dataframe(ideas_df, use_container_width=True, height=320)
+
+    for idea in ideas:
+        with st.expander(f"{idea.ticker}: {STRATEGY_LABELS[idea.strategy]} ({idea.confidence} confidence)"):
+            st.write(f"Rationale: {idea.rationale}")
+            st.write(f"Plan: {idea.trade_plan}")
+            st.write(f"Contracts: {idea.contracts}")
+            st.write(f"Estimated Capital Required: ${idea.capital_required:,.2f}")
+            st.write(f"Estimated Max Loss: ${idea.est_max_loss_dollars:,.2f}")
+            st.write(f"Max Profit: {idea.max_profit}")
+            st.write(f"Max Risk: {idea.max_risk}")
+            st.write(f"Breakeven: {idea.breakeven}")
+            st.write(f"Next Earnings: {idea.earnings_date}")
+
+    st.subheader("AI Memo")
+    memo_col1, memo_col2, memo_col3 = st.columns([2, 2, 1])
+    with memo_col1:
+        selected_ticker = st.selectbox(
+            "Memo For Ticker",
+            [idea.ticker for idea in ideas],
+            key="memo_ticker",
+        )
+    with memo_col2:
+        memo_model = st.text_input("AI Model", value="gpt-4.1-mini", key="memo_model")
+    with memo_col3:
+        st.write("")
+        st.write("")
+        generate_memo_clicked = st.button("Generate AI Memo", type="secondary")
+
+    api_key_input = st.text_input(
+        "OpenAI API Key (optional, uses offline memo if blank)",
+        type="password",
+        key="memo_api_key",
+    )
+
+    if generate_memo_clicked:
+        selected_idea = next((item for item in ideas if item.ticker == selected_ticker), None)
+        if selected_idea:
+            memo_text, memo_source = generate_ai_memo(
+                idea=selected_idea,
+                risk_level=result_risk_level,
+                next_day=result_next_day,
+                api_key=api_key_input,
+                model=memo_model.strip() or "gpt-4.1-mini",
+            )
+            st.session_state.ai_memos[selected_ticker] = {
+                "memo": memo_text,
+                "source": memo_source,
+            }
+
+    if selected_ticker in st.session_state.ai_memos:
+        memo_block = st.session_state.ai_memos[selected_ticker]
+        source_label = memo_block["source"]
+        if source_label == "openai":
+            st.caption("Memo source: OpenAI")
+        elif source_label == "fallback":
+            st.caption("Memo source: OpenAI fallback template (API call failed)")
+        else:
+            st.caption("Memo source: Offline template")
+        st.markdown(memo_block["memo"])
         st.download_button(
-            "Download Trade Tickets (CSV)",
-            data=csv_bytes,
-            file_name=f"next_day_trade_tickets_{next_day}.csv",
-            mime="text/csv",
+            f"Download Memo ({selected_ticker})",
+            data=memo_block["memo"].encode("utf-8"),
+            file_name=f"ai_memo_{selected_ticker}_{result_next_day}.md",
+            mime="text/markdown",
         )
 
-        try:
-            pdf_bytes = build_pdf_report_bytes(
-                ideas=ideas,
-                next_day=next_day,
-                risk_level=risk_level,
-                account_size=float(account_size),
-                max_risk_per_trade_pct=float(max_risk_per_trade_pct),
-            )
-            st.download_button(
-                "Download Trade Tickets (PDF)",
-                data=pdf_bytes,
-                file_name=f"next_day_trade_tickets_{next_day}.pdf",
-                mime="application/pdf",
-            )
-        except Exception as exc:
-            st.warning(f"PDF export is temporarily unavailable: {type(exc).__name__}. CSV export still works.")
+    st.subheader("Trade Ticket Export")
+    st.dataframe(tickets_df, use_container_width=True, height=320)
 
-        if skipped:
-            st.caption("Skipped tickers and reasons")
-            st.table(pd.DataFrame({"Ticker": list(skipped.keys()), "Reason": list(skipped.values())}))
+    csv_bytes = tickets_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download Trade Tickets (CSV)",
+        data=csv_bytes,
+        file_name=f"next_day_trade_tickets_{result_next_day}.csv",
+        mime="text/csv",
+    )
+
+    try:
+        pdf_bytes = build_pdf_report_bytes(
+            ideas=ideas,
+            next_day=result_next_day,
+            risk_level=result_risk_level,
+            account_size=float(result_account_size),
+            max_risk_per_trade_pct=float(result_max_risk_pct),
+        )
+        st.download_button(
+            "Download Trade Tickets (PDF)",
+            data=pdf_bytes,
+            file_name=f"next_day_trade_tickets_{result_next_day}.pdf",
+            mime="application/pdf",
+        )
+    except Exception as exc:
+        st.warning(f"PDF export is temporarily unavailable: {type(exc).__name__}. CSV export still works.")
+
+    if skipped:
+        st.caption("Skipped tickers and reasons")
+        st.table(pd.DataFrame({"Ticker": list(skipped.keys()), "Reason": list(skipped.values())}))
 
 
 if __name__ == "__main__":

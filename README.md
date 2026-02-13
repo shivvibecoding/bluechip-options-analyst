@@ -26,6 +26,18 @@ Analyst-style app for generating **next-trading-day** options ideas on blue-chip
   - CSV download for systematic execution workflows
   - PDF ticket report for review or sharing
 
+## AI memo feature
+
+- Generate an analyst-style "Trade Committee Memo" per trade idea with:
+  - Executive summary
+  - Key risks
+  - Pre-market and intraday checklists
+  - Beginner-friendly explanation
+  - Desk-style analyst note
+- Works in two modes:
+  - OpenAI mode (enter API key in app or set `OPENAI_API_KEY` in Streamlit secrets)
+  - Offline fallback mode (built-in memo template)
+
 ## Run
 
 ```bash
