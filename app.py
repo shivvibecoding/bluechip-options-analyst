@@ -33,6 +33,12 @@ STRATEGY_LABELS = {
     "cash_secured_put": "Sell Cash-Secured Put",
 }
 
+CHAT_PERSONAS: Dict[str, str] = {
+    "Calm Mentor": "Speak calmly, clearly, and with patience. Reduce anxiety while reinforcing discipline.",
+    "Desk Strategist": "Speak like a pragmatic trading-desk coach: concise, direct, and execution-focused.",
+    "Tough Coach": "Be blunt but constructive. Challenge weak logic and force clear risk rules.",
+}
+
 
 @dataclass
 class CandidateTrade:
@@ -889,9 +895,9 @@ def generate_ai_memo(
         return fallback_ai_memo(idea, risk_level, next_day), "fallback"
 
 
-def fallback_chat_reply(user_text: str, context_tickers: List[str], risk_level: str) -> str:
+def fallback_chat_reply(user_text: str, context_tickers: List[str], risk_level: str, persona: str) -> str:
     base = (
-        f"Risk mode is {risk_level}. "
+        f"[{persona}] Risk mode is {risk_level}. "
         f"Current context tickers: {', '.join(context_tickers) if context_tickers else 'none'}."
     )
     if "explain" in user_text.lower():
@@ -917,12 +923,15 @@ def call_openai_chat(
     risk_level: str,
     context_tickers: List[str],
     chat_history: List[Dict[str, str]],
+    persona: str,
 ) -> str:
     recent = chat_history[-10:]
     history_text = "\n".join([f"{m['role']}: {m['content']}" for m in recent])
     prompt = (
         "You are a professional options coach assisting with conservative/moderate strategy decisions. "
         "Be practical, concise, and risk-aware. Do not give guarantees.\n\n"
+        f"Personality mode: {persona}\n"
+        f"Personality instructions: {CHAT_PERSONAS.get(persona, CHAT_PERSONAS['Desk Strategist'])}\n"
         f"Risk mode: {risk_level}\n"
         f"Context tickers: {', '.join(context_tickers) if context_tickers else 'none'}\n"
         f"Recent chat:\n{history_text}\n\n"
@@ -1284,7 +1293,7 @@ def main() -> None:
         )
 
     st.subheader("AI Chatbot")
-    chat_settings_col1, chat_settings_col2 = st.columns(2)
+    chat_settings_col1, chat_settings_col2, chat_settings_col3 = st.columns(3)
     with chat_settings_col1:
         chat_model = st.text_input("Chat Model", value="gpt-4.1-mini", key="chat_model")
     with chat_settings_col2:
@@ -1293,6 +1302,8 @@ def main() -> None:
             type="password",
             key="chat_api_key",
         )
+    with chat_settings_col3:
+        chat_persona = st.selectbox("Chat Personality", list(CHAT_PERSONAS.keys()), index=1, key="chat_persona")
 
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
@@ -1321,11 +1332,12 @@ def main() -> None:
                     risk_level=result_risk_level,
                     context_tickers=context_tickers,
                     chat_history=st.session_state.chat_history,
+                    persona=chat_persona,
                 )
             except Exception:
-                bot_reply = fallback_chat_reply(user_chat, context_tickers, result_risk_level)
+                bot_reply = fallback_chat_reply(user_chat, context_tickers, result_risk_level, chat_persona)
         else:
-            bot_reply = fallback_chat_reply(user_chat, context_tickers, result_risk_level)
+            bot_reply = fallback_chat_reply(user_chat, context_tickers, result_risk_level, chat_persona)
 
         st.session_state.chat_history.append({"role": "assistant", "content": bot_reply})
         with st.chat_message("assistant"):
