@@ -1,6 +1,7 @@
 import math
 import json
 import time
+import random
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Dict, List, Optional, Tuple
@@ -442,7 +443,7 @@ def fetch_history_with_retry(tk: yf.Ticker, ticker: str, retries: int = 3) -> pd
                 return fallback
         except Exception as exc:
             last_exc = exc
-        time.sleep(0.35 * (attempt + 1))
+        time.sleep((0.45 * (attempt + 1)) + random.uniform(0.05, 0.25))
     if last_exc:
         raise last_exc
     raise RuntimeError("No recent price history")
@@ -455,10 +456,34 @@ def fetch_options_with_retry(tk: yf.Ticker, expiry: str, retries: int = 3):
             return tk.option_chain(expiry)
         except Exception as exc:
             last_exc = exc
-            time.sleep(0.35 * (attempt + 1))
+            time.sleep((0.55 * (attempt + 1)) + random.uniform(0.1, 0.35))
     if last_exc:
         raise last_exc
     raise RuntimeError("Option chain unavailable")
+
+
+def is_rate_limit_error(exc: Exception) -> bool:
+    text = f"{type(exc).__name__}: {str(exc)}".lower()
+    return "ratelimit" in text or "rate limit" in text or "too many requests" in text
+
+
+def fetch_expiries_with_retry(tk: yf.Ticker, retries: int = 4) -> List[str]:
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            expiries = list(tk.options)
+            if expiries:
+                return expiries
+            raise RuntimeError("No expiries returned")
+        except Exception as exc:
+            last_exc = exc
+            if is_rate_limit_error(exc):
+                time.sleep((1.2 * (attempt + 1)) + random.uniform(0.2, 0.6))
+            else:
+                time.sleep((0.45 * (attempt + 1)) + random.uniform(0.05, 0.2))
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Expiry fetch failed")
 
 
 def build_trade_idea(
@@ -486,8 +511,13 @@ def build_trade_idea(
 
     sig = compute_signal_strength(hist)
     try:
-        expiries = list(tk.options)
+        expiries = fetch_expiries_with_retry(tk, retries=4)
     except Exception as exc:
+        if is_rate_limit_error(exc):
+            return (
+                None,
+                "Expiry fetch rate-limited by Yahoo Finance. Wait 1-3 minutes, then retry with fewer tickers (2-4).",
+            )
         return None, f"Expiry fetch failed: {type(exc).__name__}: {str(exc)[:90]}"
 
     expiry = pick_expiry(expiries, risk_level, as_of)
@@ -507,8 +537,13 @@ def build_trade_idea(
         return None, "Earnings filter: near event window"
 
     try:
-        chain = fetch_options_with_retry(tk, expiry=expiry, retries=3)
+        chain = fetch_options_with_retry(tk, expiry=expiry, retries=4)
     except Exception as exc:
+        if is_rate_limit_error(exc):
+            return (
+                None,
+                "Option chain rate-limited by Yahoo Finance. Wait 1-3 minutes, then retry with fewer tickers (2-4).",
+            )
         return None, f"Option chain failed: {type(exc).__name__}: {str(exc)[:90]}"
     calls = chain.calls.copy()
     puts = chain.puts.copy()
@@ -1016,6 +1051,7 @@ def main() -> None:
     if st.button("Analyze and Generate Next-Day Trades", type="primary"):
         ideas: List[CandidateTrade] = []
         skipped: Dict[str, str] = {}
+        rate_limited = False
 
         progress = st.progress(0)
         for idx, ticker in enumerate(tickers):
@@ -1038,13 +1074,22 @@ def main() -> None:
                     ideas.append(idea)
                 else:
                     skipped[ticker] = reason
+                    if isinstance(reason, str) and "rate-limit" in reason.lower():
+                        rate_limited = True
             except Exception as exc:
                 skipped[ticker] = f"Unhandled error: {type(exc).__name__}: {str(exc)[:120]}"
 
             progress.progress((idx + 1) / len(tickers))
+            if rate_limited:
+                break
+            time.sleep(0.15)
 
         if not ideas:
             st.error("No qualifying trades found with current constraints. Adjust filters or risk limits.")
+            if rate_limited:
+                st.warning(
+                    "Yahoo Finance rate-limited this request. Try again in 1-3 minutes and analyze fewer tickers at once."
+                )
             if skipped:
                 st.write("Skip reasons:")
                 st.table(pd.DataFrame({"Ticker": list(skipped.keys()), "Reason": list(skipped.values())}))
