@@ -1148,6 +1148,10 @@ def main() -> None:
                 "content": "I am your options coach bot. Ask about setups, entries, sizing, or risk controls.",
             }
         ]
+    if "chat_last_source" not in st.session_state:
+        st.session_state.chat_last_source = "offline"
+    if "chat_last_error" not in st.session_state:
+        st.session_state.chat_last_error = ""
 
     if st.button("Analyze and Generate Next-Day Trades", type="primary"):
         ideas: List[CandidateTrade] = []
@@ -1309,6 +1313,18 @@ def main() -> None:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
+    manual_key_present = bool(chat_api_key_input.strip())
+    secret_key_present = False
+    try:
+        secret_key_present = bool(str(st.secrets.get("OPENAI_API_KEY", "")).strip())
+    except Exception:
+        secret_key_present = False
+
+    key_source = "manual input" if manual_key_present else ("Streamlit secret" if secret_key_present else "none")
+    st.caption(f"Chat key source: {key_source} | Last response source: {st.session_state.chat_last_source}")
+    if st.session_state.chat_last_error:
+        st.caption(f"Last OpenAI error: {st.session_state.chat_last_error}")
+
     user_chat = st.chat_input("Ask the coach bot about today's trade setups...")
     if user_chat:
         st.session_state.chat_history.append({"role": "user", "content": user_chat})
@@ -1334,10 +1350,16 @@ def main() -> None:
                     chat_history=st.session_state.chat_history,
                     persona=chat_persona,
                 )
-            except Exception:
+                st.session_state.chat_last_source = "openai"
+                st.session_state.chat_last_error = ""
+            except Exception as exc:
                 bot_reply = fallback_chat_reply(user_chat, context_tickers, result_risk_level, chat_persona)
+                st.session_state.chat_last_source = "offline-fallback"
+                st.session_state.chat_last_error = f"{type(exc).__name__}: {str(exc)[:180]}"
         else:
             bot_reply = fallback_chat_reply(user_chat, context_tickers, result_risk_level, chat_persona)
+            st.session_state.chat_last_source = "offline-no-key"
+            st.session_state.chat_last_error = ""
 
         st.session_state.chat_history.append({"role": "assistant", "content": bot_reply})
         with st.chat_message("assistant"):
