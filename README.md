@@ -26,6 +26,18 @@ Analyst-style app for generating **next-trading-day** options ideas on blue-chip
   - CSV download for systematic execution workflows
   - PDF ticket report for review or sharing
 
+## UX + trader feature upgrades
+
+- Liquidity filters:
+  - Minimum Open Interest
+  - Minimum Option Volume
+  - Maximum bid-ask spread %
+- Tradability Score on every trade idea (combines spread, OI, volume, and setup quality)
+- Mobile-friendly trade card view (default) with optional table view
+- Auto provider failover:
+  - `auto` mode tries Yahoo first
+  - falls back to Tradier when Yahoo is rate-limited/unavailable
+
 ## AI memo feature
 
 - Generate an analyst-style "Trade Committee Memo" per trade idea with:

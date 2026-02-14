@@ -60,6 +60,11 @@ class CandidateTrade:
     est_max_loss_dollars: float = 0.0
     capital_required: float = 0.0
     earnings_date: str = "N/A"
+    option_volume: int = 0
+    option_oi: int = 0
+    spread_pct: float = 0.0
+    tradability_score: float = 0.0
+    provider_used: str = "unknown"
 
 
 def next_business_day(today: Optional[date] = None) -> date:
@@ -150,6 +155,47 @@ def confidence_label(score: float) -> str:
     return "Low"
 
 
+def with_liquidity_fields(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "openInterest" not in out.columns:
+        out["openInterest"] = 0
+    if "volume" not in out.columns:
+        out["volume"] = 0
+    out["openInterest"] = pd.to_numeric(out["openInterest"], errors="coerce").fillna(0).astype(int)
+    out["volume"] = pd.to_numeric(out["volume"], errors="coerce").fillna(0).astype(int)
+    out["bid"] = pd.to_numeric(out.get("bid", 0), errors="coerce").fillna(0.0)
+    out["ask"] = pd.to_numeric(out.get("ask", 0), errors="coerce").fillna(0.0)
+    out["mid"] = out.apply(
+        lambda r: option_mid(float(r.get("bid", 0)), float(r.get("ask", 0)), float(r.get("lastPrice", 0))),
+        axis=1,
+    )
+    out["spread_pct"] = out.apply(
+        lambda r: ((float(r["ask"]) - float(r["bid"])) / float(r["mid"]) * 100.0)
+        if float(r["mid"]) > 0
+        else 999.0,
+        axis=1,
+    )
+    return out
+
+
+def apply_liquidity_filter(df: pd.DataFrame, min_oi: int, min_volume: int, max_spread_pct: float) -> pd.DataFrame:
+    out = with_liquidity_fields(df)
+    return out[
+        (out["openInterest"] >= int(min_oi))
+        & (out["volume"] >= int(min_volume))
+        & (out["spread_pct"] <= float(max_spread_pct))
+        & (out["mid"] > 0.05)
+    ].copy()
+
+
+def compute_tradability_score(base_score: float, spread_pct: float, oi: int, volume: int) -> float:
+    spread_component = max(0.0, 100.0 - (spread_pct * 5.0))
+    oi_component = min(100.0, (oi / 1000.0) * 100.0)
+    vol_component = min(100.0, (volume / 500.0) * 100.0)
+    strategy_component = max(0.0, min(100.0, base_score * 100.0))
+    return round((0.35 * spread_component) + (0.3 * oi_component) + (0.2 * vol_component) + (0.15 * strategy_component), 1)
+
+
 def extract_next_earnings_date(tk: yf.Ticker) -> Optional[date]:
     # yfinance calendar shapes vary; this parser handles common variants.
     try:
@@ -210,6 +256,9 @@ def generate_naked_call(
     risk_level: str,
     expiry: str,
     max_premium_budget: float,
+    min_oi: int,
+    min_volume: int,
+    max_spread_pct: float,
 ) -> Optional[CandidateTrade]:
     if risk_level == "conservative":
         return None
@@ -224,11 +273,8 @@ def generate_naked_call(
     if pool.empty:
         return None
 
-    pool["mid"] = pool.apply(
-        lambda r: option_mid(float(r.get("bid", 0)), float(r.get("ask", 0)), float(r.get("lastPrice", 0))),
-        axis=1,
-    )
-    pool = pool[(pool["mid"] > 0.05) & (pool["mid"] * 100 <= max_premium_budget)]
+    pool = apply_liquidity_filter(pool, min_oi=min_oi, min_volume=min_volume, max_spread_pct=max_spread_pct)
+    pool = pool[(pool["mid"] * 100 <= max_premium_budget)]
     if pool.empty:
         return None
 
@@ -237,6 +283,9 @@ def generate_naked_call(
 
     premium = float(best["mid"])
     strike = float(best["strike"])
+    oi = int(best.get("openInterest", 0))
+    vol = int(best.get("volume", 0))
+    spread_pct = float(best.get("spread_pct", 999.0))
     score = min(0.9, 0.55 + sig["total"] * 0.4)
 
     return CandidateTrade(
@@ -254,6 +303,10 @@ def generate_naked_call(
         max_profit="Unlimited upside",
         max_risk=f"Premium paid per contract: ${premium * 100:.2f}",
         breakeven=f"${strike + premium:.2f}",
+        option_volume=vol,
+        option_oi=oi,
+        spread_pct=spread_pct,
+        tradability_score=compute_tradability_score(score, spread_pct, oi, vol),
     )
 
 
@@ -264,6 +317,9 @@ def generate_covered_call(
     risk_level: str,
     expiry: str,
     shares_owned: int,
+    min_oi: int,
+    min_volume: int,
+    max_spread_pct: float,
 ) -> Optional[CandidateTrade]:
     if shares_owned < 100:
         return None
@@ -275,11 +331,7 @@ def generate_covered_call(
     if pool.empty:
         return None
 
-    pool["mid"] = pool.apply(
-        lambda r: option_mid(float(r.get("bid", 0)), float(r.get("ask", 0)), float(r.get("lastPrice", 0))),
-        axis=1,
-    )
-    pool = pool[pool["mid"] > 0.05]
+    pool = apply_liquidity_filter(pool, min_oi=min_oi, min_volume=min_volume, max_spread_pct=max_spread_pct)
     if pool.empty:
         return None
 
@@ -288,6 +340,9 @@ def generate_covered_call(
 
     premium = float(best["mid"])
     strike = float(best["strike"])
+    oi = int(best.get("openInterest", 0))
+    vol = int(best.get("volume", 0))
+    spread_pct = float(best.get("spread_pct", 999.0))
     call_yield = premium / spot
 
     base = 0.78 if risk_level == "conservative" else 0.68
@@ -308,6 +363,10 @@ def generate_covered_call(
         max_profit=f"~${((strike - spot + premium) * 100):.2f} per contract plus dividends if held",
         max_risk="Stock downside risk remains (partially cushioned by premium)",
         breakeven=f"${spot - premium:.2f}",
+        option_volume=vol,
+        option_oi=oi,
+        spread_pct=spread_pct,
+        tradability_score=compute_tradability_score(score, spread_pct, oi, vol),
     )
 
 
@@ -318,6 +377,9 @@ def generate_cash_secured_put(
     risk_level: str,
     expiry: str,
     cash_per_trade: float,
+    min_oi: int,
+    min_volume: int,
+    max_spread_pct: float,
 ) -> Optional[CandidateTrade]:
     spot = sig["spot"]
     discount = 0.06 if risk_level == "conservative" else 0.04
@@ -326,11 +388,8 @@ def generate_cash_secured_put(
     if pool.empty:
         return None
 
-    pool["mid"] = pool.apply(
-        lambda r: option_mid(float(r.get("bid", 0)), float(r.get("ask", 0)), float(r.get("lastPrice", 0))),
-        axis=1,
-    )
-    pool = pool[(pool["mid"] > 0.05) & (pool["strike"] * 100 <= cash_per_trade)]
+    pool = apply_liquidity_filter(pool, min_oi=min_oi, min_volume=min_volume, max_spread_pct=max_spread_pct)
+    pool = pool[(pool["strike"] * 100 <= cash_per_trade)]
     if pool.empty:
         return None
 
@@ -339,6 +398,9 @@ def generate_cash_secured_put(
 
     premium = float(best["mid"])
     strike = float(best["strike"])
+    oi = int(best.get("openInterest", 0))
+    vol = int(best.get("volume", 0))
+    spread_pct = float(best.get("spread_pct", 999.0))
     collateral = strike * 100
     roc = (premium * 100) / collateral
 
@@ -360,6 +422,10 @@ def generate_cash_secured_put(
         max_profit=f"Premium received per contract: ${premium * 100:.2f}",
         max_risk=f"Assignment risk down to near-zero stock price (net entry ${strike - premium:.2f})",
         breakeven=f"${strike - premium:.2f}",
+        option_volume=vol,
+        option_oi=oi,
+        spread_pct=spread_pct,
+        tradability_score=compute_tradability_score(score, spread_pct, oi, vol),
     )
 
 
@@ -531,14 +597,16 @@ def fetch_tradier_chain(symbol: str, expiry: str, tradier_token: str) -> Tuple[p
                 "bid": float(item.get("bid") or 0.0),
                 "ask": float(item.get("ask") or 0.0),
                 "lastPrice": float(item.get("last") or 0.0),
+                "openInterest": int(item.get("open_interest") or 0),
+                "volume": int(item.get("volume") or 0),
                 "type": str(item.get("option_type", "")).lower(),
             }
         )
     df = pd.DataFrame(rows)
     if df.empty:
         return pd.DataFrame(), pd.DataFrame()
-    calls = df[df["type"] == "call"][["strike", "bid", "ask", "lastPrice"]].copy()
-    puts = df[df["type"] == "put"][["strike", "bid", "ask", "lastPrice"]].copy()
+    calls = df[df["type"] == "call"][["strike", "bid", "ask", "lastPrice", "openInterest", "volume"]].copy()
+    puts = df[df["type"] == "put"][["strike", "bid", "ask", "lastPrice", "openInterest", "volume"]].copy()
     return calls, puts
 
 
@@ -557,6 +625,9 @@ def build_trade_idea(
     avoid_if_before_expiry: bool,
     options_provider: str,
     tradier_token: str,
+    min_oi: int,
+    min_volume: int,
+    max_spread_pct: float,
 ) -> Tuple[Optional[CandidateTrade], str]:
     tk = yf.Ticker(ticker)
 
@@ -568,21 +639,42 @@ def build_trade_idea(
         return None, "No recent price history"
 
     sig = compute_signal_strength(hist)
-    if options_provider == "tradier":
+    provider_used = "yahoo"
+    if options_provider == "auto":
+        try:
+            expiries = fetch_expiries_with_retry(tk, retries=4)
+            provider_used = "yahoo"
+        except Exception as exc:
+            if tradier_token.strip():
+                try:
+                    expiries = fetch_tradier_expiries(ticker, tradier_token.strip())
+                    provider_used = "tradier"
+                except Exception as t_exc:
+                    return None, f"Auto provider failed (Yahoo+Tradier): {type(t_exc).__name__}: {str(t_exc)[:90]}"
+            else:
+                if is_rate_limit_error(exc):
+                    return (
+                        None,
+                        "Yahoo rate-limited and no Tradier token configured. Add TRADIER_TOKEN or switch provider.",
+                    )
+                return None, f"Expiry fetch failed: {type(exc).__name__}: {str(exc)[:90]}"
+    elif options_provider == "tradier":
         if not tradier_token.strip():
             return None, "Tradier token missing. Add TRADIER_TOKEN secret or paste token in app."
         try:
             expiries = fetch_tradier_expiries(ticker, tradier_token.strip())
+            provider_used = "tradier"
         except Exception as exc:
             return None, f"Tradier expiry fetch failed: {type(exc).__name__}: {str(exc)[:90]}"
     else:
         try:
             expiries = fetch_expiries_with_retry(tk, retries=4)
+            provider_used = "yahoo"
         except Exception as exc:
             if is_rate_limit_error(exc):
                 return (
                     None,
-                    "Expiry fetch rate-limited by Yahoo Finance. Switch provider to Tradier or retry later.",
+                    "Expiry fetch rate-limited by Yahoo Finance. Switch provider to Tradier or auto.",
                 )
             return None, f"Expiry fetch failed: {type(exc).__name__}: {str(exc)[:90]}"
 
@@ -602,7 +694,7 @@ def build_trade_idea(
             return None, f"Earnings filter: next earnings on {earnings_dt}"
         return None, "Earnings filter: near event window"
 
-    if options_provider == "tradier":
+    if provider_used == "tradier":
         try:
             calls, puts = fetch_tradier_chain(ticker, expiry, tradier_token.strip())
         except Exception as exc:
@@ -611,14 +703,28 @@ def build_trade_idea(
         try:
             chain = fetch_options_with_retry(tk, expiry=expiry, retries=4)
         except Exception as exc:
-            if is_rate_limit_error(exc):
+            if options_provider == "auto" and tradier_token.strip():
+                try:
+                    tradier_expiries = fetch_tradier_expiries(ticker, tradier_token.strip())
+                    tradier_expiry = pick_expiry(tradier_expiries, risk_level, as_of)
+                    if tradier_expiry:
+                        calls, puts = fetch_tradier_chain(ticker, tradier_expiry, tradier_token.strip())
+                        provider_used = "tradier"
+                        expiry = tradier_expiry
+                    else:
+                        return None, "Auto fallback failed: no Tradier expiry in valid DTE window"
+                except Exception as t_exc:
+                    return None, f"Auto fallback chain failed: {type(t_exc).__name__}: {str(t_exc)[:90]}"
+            elif is_rate_limit_error(exc):
                 return (
                     None,
-                    "Option chain rate-limited by Yahoo Finance. Switch provider to Tradier or retry later.",
+                    "Option chain rate-limited by Yahoo Finance. Switch provider to Tradier or auto.",
                 )
-            return None, f"Option chain failed: {type(exc).__name__}: {str(exc)[:90]}"
-        calls = chain.calls.copy()
-        puts = chain.puts.copy()
+            else:
+                return None, f"Option chain failed: {type(exc).__name__}: {str(exc)[:90]}"
+        if provider_used == "yahoo":
+            calls = chain.calls.copy()
+            puts = chain.puts.copy()
 
     if calls.empty and puts.empty:
         return None, "Option chain data empty for selected expiry"
@@ -626,22 +732,55 @@ def build_trade_idea(
     candidates: List[CandidateTrade] = []
 
     if "naked_call" in allowed_strategies:
-        idea = generate_naked_call(ticker, calls, sig, risk_level, expiry, max_premium_budget=max_premium_budget)
+        idea = generate_naked_call(
+            ticker,
+            calls,
+            sig,
+            risk_level,
+            expiry,
+            max_premium_budget=max_premium_budget,
+            min_oi=min_oi,
+            min_volume=min_volume,
+            max_spread_pct=max_spread_pct,
+        )
         if idea:
+            idea.provider_used = provider_used
             candidates.append(idea)
 
     if "covered_call" in allowed_strategies:
-        idea = generate_covered_call(ticker, calls, sig, risk_level, expiry, shares_owned=shares_owned)
+        idea = generate_covered_call(
+            ticker,
+            calls,
+            sig,
+            risk_level,
+            expiry,
+            shares_owned=shares_owned,
+            min_oi=min_oi,
+            min_volume=min_volume,
+            max_spread_pct=max_spread_pct,
+        )
         if idea:
+            idea.provider_used = provider_used
             candidates.append(idea)
 
     if "cash_secured_put" in allowed_strategies:
-        idea = generate_cash_secured_put(ticker, puts, sig, risk_level, expiry, cash_per_trade=cash_per_trade)
+        idea = generate_cash_secured_put(
+            ticker,
+            puts,
+            sig,
+            risk_level,
+            expiry,
+            cash_per_trade=cash_per_trade,
+            min_oi=min_oi,
+            min_volume=min_volume,
+            max_spread_pct=max_spread_pct,
+        )
         if idea:
+            idea.provider_used = provider_used
             candidates.append(idea)
 
     if not candidates:
-        return None, "No strategy qualified under current filters"
+        return None, "No strategy qualified under current filters (including liquidity thresholds)"
 
     best = sorted(candidates, key=lambda c: c.score, reverse=True)[0]
     sized = apply_position_sizing(
@@ -673,13 +812,34 @@ def ideas_to_df(ideas: List[CandidateTrade]) -> pd.DataFrame:
                 "Expiry": idea.expiry,
                 "Strike": round(idea.strike, 2),
                 "Mid Premium": round(idea.premium, 2),
+                "Spread %": round(idea.spread_pct, 2),
+                "Volume": int(idea.option_volume),
+                "OI": int(idea.option_oi),
+                "Tradability": round(idea.tradability_score, 1),
                 "Capital Req ($)": round(idea.capital_required, 2),
                 "Est Max Loss ($)": round(idea.est_max_loss_dollars, 2),
                 "Breakeven": idea.breakeven,
                 "Next Earnings": idea.earnings_date,
+                "Provider": idea.provider_used,
             }
         )
     return pd.DataFrame(rows)
+
+
+def render_trade_cards(ideas: List[CandidateTrade]) -> None:
+    for idea in ideas:
+        st.markdown(
+            (
+                "<div class='trade-card'>"
+                f"<div class='trade-card-head'><strong>{idea.ticker}</strong> · {STRATEGY_LABELS[idea.strategy]}</div>"
+                f"<div class='trade-card-row'>Confidence: {idea.confidence} | Score: {idea.score:.3f} | Tradability: {idea.tradability_score:.1f}</div>"
+                f"<div class='trade-card-row'>Expiry {idea.expiry} | Strike ${idea.strike:.2f} | Mid ${idea.premium:.2f} | Contracts {idea.contracts}</div>"
+                f"<div class='trade-card-row'>Spread {idea.spread_pct:.2f}% | Vol {idea.option_volume} | OI {idea.option_oi} | Provider {idea.provider_used}</div>"
+                f"<div class='trade-card-row'>Capital ${idea.capital_required:,.0f} | Est Max Loss ${idea.est_max_loss_dollars:,.0f}</div>"
+                "</div>"
+            ),
+            unsafe_allow_html=True,
+        )
 
 
 def build_trade_tickets_df(ideas: List[CandidateTrade], next_day: date) -> pd.DataFrame:
@@ -700,6 +860,8 @@ def build_trade_tickets_df(ideas: List[CandidateTrade], next_day: date) -> pd.Da
                 "LimitPremium": round(idea.premium, 2),
                 "EstimatedCapital": round(idea.capital_required, 2),
                 "EstimatedMaxLoss": round(idea.est_max_loss_dollars, 2),
+                "TradabilityScore": round(idea.tradability_score, 1),
+                "Provider": idea.provider_used,
                 "Breakeven": idea.breakeven,
                 "Rationale": idea.rationale,
                 "Plan": idea.trade_plan,
@@ -987,6 +1149,22 @@ def render_header(next_day: date) -> None:
             padding-right: 1rem;
             max-width: 1200px;
         }
+        .trade-card {
+            border: 1px solid rgba(49, 51, 63, 0.25);
+            border-radius: 12px;
+            padding: 0.75rem 0.85rem;
+            margin-bottom: 0.55rem;
+            background: linear-gradient(180deg, rgba(250,250,252,0.94), rgba(244,246,252,0.9));
+        }
+        .trade-card-head {
+            font-size: 0.98rem;
+            margin-bottom: 0.25rem;
+        }
+        .trade-card-row {
+            font-size: 0.88rem;
+            margin-bottom: 0.1rem;
+            color: rgba(49, 51, 63, 0.95);
+        }
         div[data-testid="stDataFrame"] {
             overflow-x: auto;
         }
@@ -1017,6 +1195,13 @@ def render_header(next_day: date) -> None:
             div[data-testid="stDataFrame"] iframe,
             div[data-testid="stDataFrame"] > div {
                 min-width: 680px;
+            }
+            .trade-card {
+                padding: 0.65rem 0.7rem;
+                border-radius: 10px;
+            }
+            .trade-card-row {
+                font-size: 0.84rem;
             }
         }
         </style>
@@ -1111,9 +1296,9 @@ def main() -> None:
     with provider_col1:
         options_provider = st.selectbox(
             "Provider",
-            ["yahoo", "tradier"],
+            ["auto", "yahoo", "tradier"],
             index=0,
-            help="Use Tradier if Yahoo rate limits options expiries/chains on Streamlit Cloud.",
+            help="Auto tries Yahoo first, then falls back to Tradier if available.",
         )
     with provider_col2:
         tradier_token_input = st.text_input(
@@ -1128,6 +1313,15 @@ def main() -> None:
             tradier_token = str(st.secrets.get("TRADIER_TOKEN", "")).strip()
         except Exception:
             tradier_token = ""
+
+    st.markdown("Liquidity Filters")
+    liq_col1, liq_col2, liq_col3 = st.columns(3)
+    with liq_col1:
+        min_oi = st.number_input("Min Open Interest", min_value=0, max_value=50000, value=50, step=10)
+    with liq_col2:
+        min_volume = st.number_input("Min Option Volume", min_value=0, max_value=50000, value=10, step=5)
+    with liq_col3:
+        max_spread_pct = st.slider("Max Bid-Ask Spread %", min_value=1.0, max_value=35.0, value=15.0, step=0.5)
 
     if not tickers:
         st.info("Select at least one ticker.")
@@ -1176,6 +1370,9 @@ def main() -> None:
                     avoid_if_before_expiry=avoid_if_before_expiry,
                     options_provider=options_provider,
                     tradier_token=tradier_token,
+                    min_oi=int(min_oi),
+                    min_volume=int(min_volume),
+                    max_spread_pct=float(max_spread_pct),
                 )
                 if idea:
                     ideas.append(idea)
@@ -1229,7 +1426,11 @@ def main() -> None:
     tickets_df = build_trade_tickets_df(ideas, result_next_day)
 
     st.subheader("Next-Day Trade Ideas")
-    st.dataframe(ideas_df, use_container_width=True, height=320)
+    view_mode = st.radio("View", ["Cards", "Table"], horizontal=True, index=0, key="trade_view_mode")
+    if view_mode == "Cards":
+        render_trade_cards(ideas)
+    else:
+        st.dataframe(ideas_df, use_container_width=True, height=320)
 
     for idea in ideas:
         with st.expander(f"{idea.ticker}: {STRATEGY_LABELS[idea.strategy]} ({idea.confidence} confidence)"):
@@ -1238,10 +1439,14 @@ def main() -> None:
             st.write(f"Contracts: {idea.contracts}")
             st.write(f"Estimated Capital Required: ${idea.capital_required:,.2f}")
             st.write(f"Estimated Max Loss: ${idea.est_max_loss_dollars:,.2f}")
+            st.write(
+                f"Tradability: {idea.tradability_score:.1f} | Spread: {idea.spread_pct:.2f}% | Volume: {idea.option_volume} | OI: {idea.option_oi}"
+            )
             st.write(f"Max Profit: {idea.max_profit}")
             st.write(f"Max Risk: {idea.max_risk}")
             st.write(f"Breakeven: {idea.breakeven}")
             st.write(f"Next Earnings: {idea.earnings_date}")
+            st.write(f"Provider: {idea.provider_used}")
 
     st.subheader("AI Memo")
     memo_col1, memo_col2, memo_col3 = st.columns([2, 2, 1])
