@@ -8,8 +8,11 @@ Analyst-style app for generating **next-trading-day** options ideas on blue-chip
 - Builds trend/momentum/volatility signals from 6 months of daily price data
 - Pulls options chains and filters ideas to only:
   - Buy Naked Call
+  - Buy Naked Put
   - Sell Covered Call
   - Sell Cash-Secured Put
+  - Buy Bull Call Spread
+  - Buy Bear Put Spread
 - Applies risk profile (`conservative` or `moderate`) and account constraints
 - Returns one top trade idea per ticker with rationale, breakeven, and risk notes
 

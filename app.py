@@ -29,8 +29,11 @@ BLUE_CHIP_TECH = [
 
 STRATEGY_LABELS = {
     "naked_call": "Buy Naked Call",
+    "naked_put": "Buy Naked Put",
     "covered_call": "Sell Covered Call",
     "cash_secured_put": "Sell Cash-Secured Put",
+    "bull_call_spread": "Buy Bull Call Spread",
+    "bear_put_spread": "Buy Bear Put Spread",
 }
 
 CHAT_PERSONAS: Dict[str, str] = {
@@ -310,6 +313,67 @@ def generate_naked_call(
     )
 
 
+def generate_naked_put(
+    ticker: str,
+    puts: pd.DataFrame,
+    sig: Dict[str, float],
+    risk_level: str,
+    expiry: str,
+    max_premium_budget: float,
+    min_oi: int,
+    min_volume: int,
+    max_spread_pct: float,
+) -> Optional[CandidateTrade]:
+    if risk_level == "conservative":
+        return None
+    if sig["total"] > -0.1:
+        return None
+
+    spot = sig["spot"]
+    min_strike = spot * 0.95
+    max_strike = spot * 1.00
+
+    pool = puts[(puts["strike"] >= min_strike) & (puts["strike"] <= max_strike)].copy()
+    if pool.empty:
+        return None
+
+    pool = apply_liquidity_filter(pool, min_oi=min_oi, min_volume=min_volume, max_spread_pct=max_spread_pct)
+    pool = pool[(pool["mid"] * 100 <= max_premium_budget)]
+    if pool.empty:
+        return None
+
+    pool["moneyness"] = (pool["strike"] - spot).abs()
+    best = pool.sort_values(["moneyness", "mid"], ascending=[True, True]).iloc[0]
+
+    premium = float(best["mid"])
+    strike = float(best["strike"])
+    oi = int(best.get("openInterest", 0))
+    vol = int(best.get("volume", 0))
+    spread_pct = float(best.get("spread_pct", 999.0))
+    score = min(0.9, 0.52 + abs(sig["total"]) * 0.42)
+
+    return CandidateTrade(
+        ticker=ticker,
+        strategy="naked_put",
+        risk_level=risk_level,
+        score=score,
+        confidence=confidence_label(score),
+        expiry=expiry,
+        strike=strike,
+        premium=premium,
+        spot=spot,
+        rationale=f"Bearish momentum setup (RSI {sig['rsi']:.1f}) with defined premium-at-risk long put.",
+        trade_plan=f"Buy puts near-the-money for {expiry}. Take profits around 40-60% gain or cut at 50% premium loss.",
+        max_profit="Substantial downside participation",
+        max_risk=f"Premium paid per contract: ${premium * 100:.2f}",
+        breakeven=f"${strike - premium:.2f}",
+        option_volume=vol,
+        option_oi=oi,
+        spread_pct=spread_pct,
+        tradability_score=compute_tradability_score(score, spread_pct, oi, vol),
+    )
+
+
 def generate_covered_call(
     ticker: str,
     calls: pd.DataFrame,
@@ -367,6 +431,72 @@ def generate_covered_call(
         option_oi=oi,
         spread_pct=spread_pct,
         tradability_score=compute_tradability_score(score, spread_pct, oi, vol),
+    )
+
+
+def generate_bull_call_spread(
+    ticker: str,
+    calls: pd.DataFrame,
+    sig: Dict[str, float],
+    risk_level: str,
+    expiry: str,
+    max_premium_budget: float,
+    min_oi: int,
+    min_volume: int,
+    max_spread_pct: float,
+) -> Optional[CandidateTrade]:
+    if sig["total"] < 0.15:
+        return None
+
+    spot = sig["spot"]
+    calls_liq = apply_liquidity_filter(calls, min_oi=min_oi, min_volume=min_volume, max_spread_pct=max_spread_pct)
+    if calls_liq.empty:
+        return None
+
+    long_leg_pool = calls_liq[(calls_liq["strike"] >= spot * 0.98) & (calls_liq["strike"] <= spot * 1.03)].copy()
+    if long_leg_pool.empty:
+        return None
+    long_leg = long_leg_pool.sort_values(["strike"]).iloc[0]
+
+    short_pool = calls_liq[calls_liq["strike"] > float(long_leg["strike"])].copy()
+    short_pool = short_pool[short_pool["strike"] <= float(long_leg["strike"]) * 1.08]
+    if short_pool.empty:
+        return None
+    short_leg = short_pool.sort_values(["strike"]).iloc[0]
+
+    net_debit = float(long_leg["mid"]) - float(short_leg["mid"])
+    width = float(short_leg["strike"]) - float(long_leg["strike"])
+    if net_debit <= 0.05 or width <= net_debit:
+        return None
+    if net_debit * 100 > max_premium_budget:
+        return None
+
+    oi = min(int(long_leg.get("openInterest", 0)), int(short_leg.get("openInterest", 0)))
+    vol = min(int(long_leg.get("volume", 0)), int(short_leg.get("volume", 0)))
+    spread_pct = max(float(long_leg.get("spread_pct", 999.0)), float(short_leg.get("spread_pct", 999.0)))
+    base_score = min(0.92, 0.58 + sig["total"] * 0.35)
+
+    return CandidateTrade(
+        ticker=ticker,
+        strategy="bull_call_spread",
+        risk_level=risk_level,
+        score=base_score,
+        confidence=confidence_label(base_score),
+        expiry=expiry,
+        strike=float(long_leg["strike"]),
+        premium=net_debit,
+        spot=spot,
+        rationale="Bullish defined-risk debit spread to cap premium outlay while targeting upside.",
+        trade_plan=(
+            f"Buy {float(long_leg['strike']):.2f} call and sell {float(short_leg['strike']):.2f} call for {expiry}."
+        ),
+        max_profit=f"Approx ${((width - net_debit) * 100):.2f} per contract",
+        max_risk=f"Net debit paid: ${net_debit * 100:.2f}",
+        breakeven=f"${float(long_leg['strike']) + net_debit:.2f}",
+        option_volume=vol,
+        option_oi=oi,
+        spread_pct=spread_pct,
+        tradability_score=compute_tradability_score(base_score, spread_pct, oi, vol),
     )
 
 
@@ -429,6 +559,72 @@ def generate_cash_secured_put(
     )
 
 
+def generate_bear_put_spread(
+    ticker: str,
+    puts: pd.DataFrame,
+    sig: Dict[str, float],
+    risk_level: str,
+    expiry: str,
+    max_premium_budget: float,
+    min_oi: int,
+    min_volume: int,
+    max_spread_pct: float,
+) -> Optional[CandidateTrade]:
+    if sig["total"] > -0.1:
+        return None
+
+    spot = sig["spot"]
+    puts_liq = apply_liquidity_filter(puts, min_oi=min_oi, min_volume=min_volume, max_spread_pct=max_spread_pct)
+    if puts_liq.empty:
+        return None
+
+    long_leg_pool = puts_liq[(puts_liq["strike"] >= spot * 0.97) & (puts_liq["strike"] <= spot * 1.02)].copy()
+    if long_leg_pool.empty:
+        return None
+    long_leg = long_leg_pool.sort_values(["strike"], ascending=False).iloc[0]
+
+    short_pool = puts_liq[puts_liq["strike"] < float(long_leg["strike"])].copy()
+    short_pool = short_pool[short_pool["strike"] >= float(long_leg["strike"]) * 0.92]
+    if short_pool.empty:
+        return None
+    short_leg = short_pool.sort_values(["strike"], ascending=False).iloc[0]
+
+    net_debit = float(long_leg["mid"]) - float(short_leg["mid"])
+    width = float(long_leg["strike"]) - float(short_leg["strike"])
+    if net_debit <= 0.05 or width <= net_debit:
+        return None
+    if net_debit * 100 > max_premium_budget:
+        return None
+
+    oi = min(int(long_leg.get("openInterest", 0)), int(short_leg.get("openInterest", 0)))
+    vol = min(int(long_leg.get("volume", 0)), int(short_leg.get("volume", 0)))
+    spread_pct = max(float(long_leg.get("spread_pct", 999.0)), float(short_leg.get("spread_pct", 999.0)))
+    base_score = min(0.92, 0.56 + abs(sig["total"]) * 0.35)
+
+    return CandidateTrade(
+        ticker=ticker,
+        strategy="bear_put_spread",
+        risk_level=risk_level,
+        score=base_score,
+        confidence=confidence_label(base_score),
+        expiry=expiry,
+        strike=float(long_leg["strike"]),
+        premium=net_debit,
+        spot=spot,
+        rationale="Bearish defined-risk debit spread to control premium while targeting downside.",
+        trade_plan=(
+            f"Buy {float(long_leg['strike']):.2f} put and sell {float(short_leg['strike']):.2f} put for {expiry}."
+        ),
+        max_profit=f"Approx ${((width - net_debit) * 100):.2f} per contract",
+        max_risk=f"Net debit paid: ${net_debit * 100:.2f}",
+        breakeven=f"${float(long_leg['strike']) - net_debit:.2f}",
+        option_volume=vol,
+        option_oi=oi,
+        spread_pct=spread_pct,
+        tradability_score=compute_tradability_score(base_score, spread_pct, oi, vol),
+    )
+
+
 def apply_position_sizing(
     idea: CandidateTrade,
     account_size: float,
@@ -439,7 +635,7 @@ def apply_position_sizing(
 ) -> Optional[CandidateTrade]:
     risk_budget = account_size * (max_risk_per_trade_pct / 100)
 
-    if idea.strategy == "naked_call":
+    if idea.strategy in {"naked_call", "naked_put", "bull_call_spread", "bear_put_spread"}:
         per_contract_risk = idea.premium * 100
         contracts_by_risk = math.floor(risk_budget / per_contract_risk) if per_contract_risk > 0 else 0
         contracts_by_premium = math.floor(max_premium_budget / per_contract_risk) if per_contract_risk > 0 else 0
@@ -450,10 +646,18 @@ def apply_position_sizing(
         idea.contracts = contracts
         idea.est_max_loss_dollars = round(contracts * per_contract_risk, 2)
         idea.capital_required = round(contracts * per_contract_risk, 2)
-        idea.trade_plan = (
-            f"Buy {contracts} call contract(s) expiring {idea.expiry}. "
-            "Target 40-60% gain; cut at 50% premium loss."
-        )
+        if idea.strategy == "naked_call":
+            idea.trade_plan = (
+                f"Buy {contracts} call contract(s) expiring {idea.expiry}. "
+                "Target 40-60% gain; cut at 50% premium loss."
+            )
+        elif idea.strategy == "naked_put":
+            idea.trade_plan = (
+                f"Buy {contracts} put contract(s) expiring {idea.expiry}. "
+                "Target 40-60% gain; cut at 50% premium loss."
+            )
+        else:
+            idea.trade_plan = f"{idea.trade_plan} Position size: {contracts} spread contract(s)."
         return idea
 
     if idea.strategy == "covered_call":
@@ -747,6 +951,22 @@ def build_trade_idea(
             idea.provider_used = provider_used
             candidates.append(idea)
 
+    if "naked_put" in allowed_strategies:
+        idea = generate_naked_put(
+            ticker,
+            puts,
+            sig,
+            risk_level,
+            expiry,
+            max_premium_budget=max_premium_budget,
+            min_oi=min_oi,
+            min_volume=min_volume,
+            max_spread_pct=max_spread_pct,
+        )
+        if idea:
+            idea.provider_used = provider_used
+            candidates.append(idea)
+
     if "covered_call" in allowed_strategies:
         idea = generate_covered_call(
             ticker,
@@ -771,6 +991,38 @@ def build_trade_idea(
             risk_level,
             expiry,
             cash_per_trade=cash_per_trade,
+            min_oi=min_oi,
+            min_volume=min_volume,
+            max_spread_pct=max_spread_pct,
+        )
+        if idea:
+            idea.provider_used = provider_used
+            candidates.append(idea)
+
+    if "bull_call_spread" in allowed_strategies:
+        idea = generate_bull_call_spread(
+            ticker,
+            calls,
+            sig,
+            risk_level,
+            expiry,
+            max_premium_budget=max_premium_budget,
+            min_oi=min_oi,
+            min_volume=min_volume,
+            max_spread_pct=max_spread_pct,
+        )
+        if idea:
+            idea.provider_used = provider_used
+            candidates.append(idea)
+
+    if "bear_put_spread" in allowed_strategies:
+        idea = generate_bear_put_spread(
+            ticker,
+            puts,
+            sig,
+            risk_level,
+            expiry,
+            max_premium_budget=max_premium_budget,
             min_oi=min_oi,
             min_volume=min_volume,
             max_spread_pct=max_spread_pct,
@@ -853,7 +1105,11 @@ def build_trade_tickets_df(ideas: List[CandidateTrade], next_day: date) -> pd.Da
                 "TradeDate": str(next_day),
                 "Ticker": idea.ticker,
                 "Strategy": STRATEGY_LABELS[idea.strategy],
-                "Action": "BUY" if idea.strategy == "naked_call" else "SELL",
+                "Action": (
+                    "BUY"
+                    if idea.strategy in {"naked_call", "naked_put", "bull_call_spread", "bear_put_spread"}
+                    else "SELL"
+                ),
                 "Contracts": idea.contracts,
                 "Expiry": idea.expiry,
                 "Strike": round(idea.strike, 2),
@@ -1246,7 +1502,7 @@ def main() -> None:
     allowed_strategy_labels = st.multiselect(
         "Allowed Strategies",
         list(STRATEGY_LABELS.values()),
-        default=[STRATEGY_LABELS["covered_call"], STRATEGY_LABELS["cash_secured_put"]],
+        default=list(STRATEGY_LABELS.values()),
     )
 
     strategy_reverse = {v: k for k, v in STRATEGY_LABELS.items()}
@@ -1276,7 +1532,7 @@ def main() -> None:
         )
     with call_col:
         max_premium_budget = st.number_input(
-            "Max premium budget for naked calls ($)",
+            "Max premium budget for long options/spreads ($)",
             min_value=100.0,
             max_value=25000.0,
             value=750.0,
