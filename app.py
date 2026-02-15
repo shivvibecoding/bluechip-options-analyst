@@ -3,7 +3,7 @@ import json
 import time
 import random
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 from urllib import error, request
@@ -1256,6 +1256,8 @@ def lifecycle_row_from_idea(idea: CandidateTrade) -> Dict[str, object]:
         "MaxSlippagePct": 5.0,
         "EventExit": True,
         "EventRiskNow": False,
+        "NextEarnings": idea.earnings_date,
+        "EventNote": "",
         "UnderlyingEntry": round(float(idea.spot), 2),
         "UnderlyingNow": round(float(idea.spot), 2),
         "InvalidationUnderlying": invalidation,
@@ -1369,6 +1371,52 @@ def lifecycle_review_df(rows: List[Dict[str, object]]) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(out)
+
+
+def parse_iso_date_safe(value: str) -> Optional[date]:
+    text = str(value or "").strip()
+    if not text or text.upper() == "N/A":
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def parse_macro_dates_csv(raw: str) -> List[date]:
+    dates: List[date] = []
+    for token in str(raw or "").split(","):
+        dt = parse_iso_date_safe(token.strip())
+        if dt:
+            dates.append(dt)
+    return dates
+
+
+def update_event_flags(rows: List[Dict[str, object]], window_days: int, macro_dates: List[date]) -> List[Dict[str, object]]:
+    today = date.today()
+    horizon = today + timedelta(days=int(window_days))
+    updated_rows: List[Dict[str, object]] = []
+
+    for row in rows:
+        item = dict(row)
+        notes: List[str] = []
+        risk_flag = False
+
+        earnings_dt = parse_iso_date_safe(str(item.get("NextEarnings", "")))
+        if earnings_dt and today <= earnings_dt <= horizon:
+            risk_flag = True
+            notes.append(f"Earnings {earnings_dt.isoformat()}")
+
+        for macro_dt in macro_dates:
+            if today <= macro_dt <= horizon:
+                risk_flag = True
+                notes.append(f"Macro {macro_dt.isoformat()}")
+
+        item["EventRiskNow"] = bool(risk_flag)
+        item["EventNote"] = "; ".join(notes)
+        updated_rows.append(item)
+
+    return updated_rows
 
 
 def build_pdf_report_bytes(
@@ -2190,6 +2238,8 @@ def main() -> None:
             "MaxSlippagePct",
             "EventExit",
             "EventRiskNow",
+            "NextEarnings",
+            "EventNote",
             "UnderlyingEntry",
             "UnderlyingNow",
             "InvalidationUnderlying",
@@ -2212,6 +2262,34 @@ def main() -> None:
         for col in base_cols:
             merged[col] = lifecycle_df[col].values
         st.session_state.lifecycle_rows = merged.to_dict(orient="records")
+
+        event_col1, event_col2, event_col3 = st.columns(3)
+        with event_col1:
+            lifecycle_event_window = st.slider(
+                "Lifecycle Event Window (days)",
+                min_value=1,
+                max_value=21,
+                value=5,
+                key="lifecycle_event_window_days",
+            )
+        with event_col2:
+            macro_dates_raw = st.text_input(
+                "Macro Dates CSV (YYYY-MM-DD)",
+                value="",
+                key="lifecycle_macro_dates",
+                help="Example: 2026-03-18, 2026-05-06",
+            )
+        with event_col3:
+            st.write("")
+            st.write("")
+            if st.button("Auto Update Event Flags", key="auto_update_event_flags"):
+                macro_dates = parse_macro_dates_csv(macro_dates_raw)
+                st.session_state.lifecycle_rows = update_event_flags(
+                    st.session_state.lifecycle_rows,
+                    window_days=int(lifecycle_event_window),
+                    macro_dates=macro_dates,
+                )
+                st.rerun()
 
         lcol1, lcol2, lcol3 = st.columns(3)
         with lcol1:

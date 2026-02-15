@@ -123,3 +123,7 @@ Options trading carries significant risk, including total loss of premium (long 
 - Manual close by ticket ID
 - Post-trade review table with plan-vs-actual and coach note
 - Lifecycle review CSV export
+- Calendar-driven event flagging in lifecycle manager:
+  - Auto-update `EventRiskNow` from upcoming earnings dates
+  - Optional macro date CSV input (e.g., FOMC/CPI dates)
+  - Configurable event window days
