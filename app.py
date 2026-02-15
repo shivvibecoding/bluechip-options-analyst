@@ -42,6 +42,9 @@ CHAT_PERSONAS: Dict[str, str] = {
     "Tough Coach": "Be blunt but constructive. Challenge weak logic and force clear risk rules.",
 }
 
+DEFAULT_OPENAI_MODEL = "gpt-5.2"
+OPENAI_MODEL_FALLBACKS = ["gpt-5-mini", "gpt-4.1-mini"]
+
 
 @dataclass
 class CandidateTrade:
@@ -1402,11 +1405,22 @@ def generate_ai_memo(
     if not key:
         return fallback_ai_memo(idea, risk_level, next_day), "offline"
 
-    try:
-        memo = call_openai_memo(key, model, idea, risk_level, next_day)
-        return memo, "openai"
-    except Exception:
-        return fallback_ai_memo(idea, risk_level, next_day), "fallback"
+    ordered_models = [model.strip() or DEFAULT_OPENAI_MODEL]
+    for m in OPENAI_MODEL_FALLBACKS:
+        if m not in ordered_models:
+            ordered_models.append(m)
+
+    last_exc: Optional[Exception] = None
+    for m in ordered_models:
+        try:
+            memo = call_openai_memo(key, m, idea, risk_level, next_day)
+            return memo, "openai"
+        except Exception as exc:
+            last_exc = exc
+            continue
+
+    _ = last_exc
+    return fallback_ai_memo(idea, risk_level, next_day), "fallback"
 
 
 def fallback_chat_reply(user_text: str, context_tickers: List[str], risk_level: str, persona: str) -> str:
@@ -1846,7 +1860,7 @@ def main() -> None:
             key="memo_ticker",
         )
     with memo_col2:
-        memo_model = st.text_input("AI Model", value="gpt-4.1-mini", key="memo_model")
+        memo_model = st.text_input("AI Model", value=DEFAULT_OPENAI_MODEL, key="memo_model")
     with memo_col3:
         st.write("")
         st.write("")
@@ -1866,7 +1880,7 @@ def main() -> None:
                 risk_level=result_risk_level,
                 next_day=result_next_day,
                 api_key=api_key_input,
-                model=memo_model.strip() or "gpt-4.1-mini",
+                model=memo_model.strip() or DEFAULT_OPENAI_MODEL,
             )
             st.session_state.ai_memos[selected_ticker] = {
                 "memo": memo_text,
@@ -1893,7 +1907,7 @@ def main() -> None:
     st.subheader("AI Chatbot")
     chat_settings_col1, chat_settings_col2, chat_settings_col3 = st.columns(3)
     with chat_settings_col1:
-        chat_model = st.text_input("Chat Model", value="gpt-4.1-mini", key="chat_model")
+        chat_model = st.text_input("Chat Model", value=DEFAULT_OPENAI_MODEL, key="chat_model")
     with chat_settings_col2:
         chat_api_key_input = st.text_input(
             "OpenAI API Key for Chat (optional)",
@@ -1934,22 +1948,40 @@ def main() -> None:
 
         context_tickers = [idea.ticker for idea in ideas]
         if key:
-            try:
-                bot_reply = call_openai_chat(
-                    api_key=key,
-                    model=chat_model.strip() or "gpt-4.1-mini",
-                    user_text=user_chat,
-                    risk_level=result_risk_level,
-                    context_tickers=context_tickers,
-                    chat_history=st.session_state.chat_history,
-                    persona=chat_persona,
-                )
-                st.session_state.chat_last_source = "openai"
-                st.session_state.chat_last_error = ""
-            except Exception as exc:
+            requested_model = chat_model.strip() or DEFAULT_OPENAI_MODEL
+            ordered_models = [requested_model]
+            for m in OPENAI_MODEL_FALLBACKS:
+                if m not in ordered_models:
+                    ordered_models.append(m)
+
+            bot_reply = ""
+            last_exc: Optional[Exception] = None
+            for candidate_model in ordered_models:
+                try:
+                    bot_reply = call_openai_chat(
+                        api_key=key,
+                        model=candidate_model,
+                        user_text=user_chat,
+                        risk_level=result_risk_level,
+                        context_tickers=context_tickers,
+                        chat_history=st.session_state.chat_history,
+                        persona=chat_persona,
+                    )
+                    st.session_state.chat_last_source = f"openai:{candidate_model}"
+                    st.session_state.chat_last_error = ""
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    continue
+
+            if not bot_reply:
                 bot_reply = fallback_chat_reply(user_chat, context_tickers, result_risk_level, chat_persona)
                 st.session_state.chat_last_source = "offline-fallback"
-                st.session_state.chat_last_error = f"{type(exc).__name__}: {str(exc)[:180]}"
+                st.session_state.chat_last_error = (
+                    f"{type(last_exc).__name__}: {str(last_exc)[:180]}"
+                    if last_exc
+                    else "No OpenAI response from attempted models"
+                )
         else:
             bot_reply = fallback_chat_reply(user_chat, context_tickers, result_risk_level, chat_persona)
             st.session_state.chat_last_source = "offline-no-key"
