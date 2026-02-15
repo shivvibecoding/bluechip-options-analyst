@@ -1126,6 +1126,102 @@ def build_trade_tickets_df(ideas: List[CandidateTrade], next_day: date) -> pd.Da
     return pd.DataFrame(rows)
 
 
+def parse_spread_legs_from_plan(trade_plan: str) -> Tuple[Optional[float], Optional[float]]:
+    nums = []
+    token = ""
+    for ch in trade_plan:
+        if ch.isdigit() or ch == ".":
+            token += ch
+        else:
+            if token:
+                try:
+                    nums.append(float(token))
+                except ValueError:
+                    pass
+                token = ""
+    if token:
+        try:
+            nums.append(float(token))
+        except ValueError:
+            pass
+    if len(nums) >= 2:
+        return nums[0], nums[1]
+    return None, None
+
+
+def estimate_contract_pnl(idea: CandidateTrade, spot_move_pct: float) -> float:
+    future_spot = idea.spot * (1.0 + (spot_move_pct / 100.0))
+    strike = idea.strike
+    premium = idea.premium
+    pnl = 0.0
+
+    if idea.strategy == "naked_call":
+        pnl = (max(future_spot - strike, 0.0) - premium) * 100
+    elif idea.strategy == "naked_put":
+        pnl = (max(strike - future_spot, 0.0) - premium) * 100
+    elif idea.strategy == "covered_call":
+        stock_pnl = (future_spot - idea.spot) * 100
+        short_call_payoff = premium * 100 - max(future_spot - strike, 0.0) * 100
+        pnl = stock_pnl + short_call_payoff
+    elif idea.strategy == "cash_secured_put":
+        pnl = premium * 100 - max(strike - future_spot, 0.0) * 100
+    elif idea.strategy in {"bull_call_spread", "bear_put_spread"}:
+        long_leg, short_leg = parse_spread_legs_from_plan(idea.trade_plan)
+        if long_leg is None or short_leg is None:
+            pnl = -premium * 100
+        elif idea.strategy == "bull_call_spread":
+            spread_value = max(future_spot - long_leg, 0.0) - max(future_spot - short_leg, 0.0)
+            pnl = (spread_value - premium) * 100
+        else:
+            spread_value = max(long_leg - future_spot, 0.0) - max(short_leg - future_spot, 0.0)
+            pnl = (spread_value - premium) * 100
+    return pnl * idea.contracts
+
+
+def scenario_dataframe(ideas: List[CandidateTrade], move_min: int, move_max: int, step: int) -> pd.DataFrame:
+    rows = []
+    for move in range(move_min, move_max + 1, step):
+        total = 0.0
+        for idea in ideas:
+            total += estimate_contract_pnl(idea, float(move))
+        rows.append({"MovePct": move, "PortfolioPnL": round(total, 2)})
+    return pd.DataFrame(rows)
+
+
+def exposure_summary_df(ideas: List[CandidateTrade]) -> pd.DataFrame:
+    delta_map = {
+        "naked_call": 0.5,
+        "naked_put": -0.5,
+        "covered_call": 0.35,
+        "cash_secured_put": 0.2,
+        "bull_call_spread": 0.25,
+        "bear_put_spread": -0.25,
+    }
+    theta_map = {
+        "naked_call": -0.05,
+        "naked_put": -0.05,
+        "covered_call": 0.03,
+        "cash_secured_put": 0.03,
+        "bull_call_spread": -0.02,
+        "bear_put_spread": -0.02,
+    }
+
+    rows = []
+    for idea in ideas:
+        contracts = idea.contracts
+        rows.append(
+            {
+                "Ticker": idea.ticker,
+                "Strategy": STRATEGY_LABELS[idea.strategy],
+                "DeltaApprox": round(delta_map.get(idea.strategy, 0.0) * contracts * 100, 2),
+                "ThetaApprox": round(theta_map.get(idea.strategy, 0.0) * contracts * 100, 2),
+                "CapitalReq": round(idea.capital_required, 2),
+                "EstMaxLoss": round(idea.est_max_loss_dollars, 2),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def build_pdf_report_bytes(
     ideas: List[CandidateTrade],
     next_day: date,
@@ -1602,6 +1698,8 @@ def main() -> None:
         st.session_state.chat_last_source = "offline"
     if "chat_last_error" not in st.session_state:
         st.session_state.chat_last_error = ""
+    if "journal_rows" not in st.session_state:
+        st.session_state.journal_rows = []
 
     if st.button("Analyze and Generate Next-Day Trades", type="primary"):
         ideas: List[CandidateTrade] = []
@@ -1688,6 +1786,26 @@ def main() -> None:
     else:
         st.dataframe(ideas_df, use_container_width=True, height=320)
 
+    st.subheader("Portfolio Exposure")
+    exp_df = exposure_summary_df(ideas)
+    st.dataframe(exp_df, use_container_width=True, height=220)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Net Delta (Approx)", f"{exp_df['DeltaApprox'].sum():.1f}")
+    c2.metric("Net Theta (Approx)", f"{exp_df['ThetaApprox'].sum():.1f}")
+    c3.metric("Total Est Max Loss", f"${exp_df['EstMaxLoss'].sum():,.0f}")
+
+    st.subheader("P/L Scenario Simulator")
+    sim_col1, sim_col2, sim_col3 = st.columns(3)
+    with sim_col1:
+        move_min = st.slider("Min Underlying Move %", -30, -1, -10, 1, key="sim_min")
+    with sim_col2:
+        move_max = st.slider("Max Underlying Move %", 1, 30, 10, 1, key="sim_max")
+    with sim_col3:
+        move_step = st.selectbox("Step %", [1, 2, 5], index=1, key="sim_step")
+    sim_df = scenario_dataframe(ideas, move_min=move_min, move_max=move_max, step=int(move_step))
+    st.line_chart(sim_df.set_index("MovePct"))
+    st.dataframe(sim_df, use_container_width=True, height=220)
+
     for idea in ideas:
         with st.expander(f"{idea.ticker}: {STRATEGY_LABELS[idea.strategy]} ({idea.confidence} confidence)"):
             st.write(f"Rationale: {idea.rationale}")
@@ -1703,6 +1821,21 @@ def main() -> None:
             st.write(f"Breakeven: {idea.breakeven}")
             st.write(f"Next Earnings: {idea.earnings_date}")
             st.write(f"Provider: {idea.provider_used}")
+            if st.button("Add To Journal", key=f"journal_add_{idea.ticker}_{idea.strategy}_{idea.expiry}"):
+                st.session_state.journal_rows.append(
+                    {
+                        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "Ticker": idea.ticker,
+                        "Strategy": STRATEGY_LABELS[idea.strategy],
+                        "Contracts": idea.contracts,
+                        "Expiry": idea.expiry,
+                        "Strike": round(idea.strike, 2),
+                        "Premium": round(idea.premium, 2),
+                        "RiskLevel": result_risk_level,
+                        "Plan": idea.trade_plan,
+                    }
+                )
+                st.success("Added to journal")
 
     st.subheader("AI Memo")
     memo_col1, memo_col2, memo_col3 = st.columns([2, 2, 1])
@@ -1835,6 +1968,22 @@ def main() -> None:
         file_name=f"coach_chat_{result_next_day}.txt",
         mime="text/plain",
     )
+
+    st.subheader("Trade Journal")
+    journal_df = pd.DataFrame(st.session_state.journal_rows)
+    if journal_df.empty:
+        st.caption("No journal entries yet. Use 'Add To Journal' on a trade card.")
+    else:
+        st.dataframe(journal_df, use_container_width=True, height=240)
+        st.download_button(
+            "Download Journal (CSV)",
+            data=journal_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"trade_journal_{result_next_day}.csv",
+            mime="text/csv",
+        )
+        if st.button("Clear Journal", key="clear_journal_btn"):
+            st.session_state.journal_rows = []
+            st.rerun()
 
     st.subheader("Trade Ticket Export")
     st.dataframe(tickets_df, use_container_width=True, height=320)

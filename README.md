@@ -100,3 +100,12 @@ OPENAI_API_KEY="sk-..."
 
 This tool is for educational support, not investment advice.
 Options trading carries significant risk, including total loss of premium (long calls) or assignment risk (short options).
+
+## Added trader productivity features
+
+- Portfolio exposure dashboard (approx net delta/theta and aggregate risk)
+- P/L scenario simulator (portfolio-level payout across underlying move ranges)
+- Trade journal workflow:
+  - Add generated ideas to journal
+  - Persist during session
+  - Export journal CSV
