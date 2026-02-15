@@ -109,3 +109,17 @@ Options trading carries significant risk, including total loss of premium (long 
   - Add generated ideas to journal
   - Persist during session
   - Export journal CSV
+
+## Trade lifecycle manager
+
+- Create lifecycle plan from any generated trade idea
+- Activate pending trades with slippage check
+- Rule-based management triggers:
+  - profit target
+  - stop loss
+  - time stop
+  - event risk exit
+  - underlying invalidation
+- Manual close by ticket ID
+- Post-trade review table with plan-vs-actual and coach note
+- Lifecycle review CSV export

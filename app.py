@@ -1225,6 +1225,152 @@ def exposure_summary_df(ideas: List[CandidateTrade]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def strategy_direction(strategy: str) -> str:
+    if strategy in {"naked_call", "bull_call_spread", "covered_call", "cash_secured_put"}:
+        return "bullish"
+    if strategy in {"naked_put", "bear_put_spread"}:
+        return "bearish"
+    return "neutral"
+
+
+def lifecycle_row_from_idea(idea: CandidateTrade) -> Dict[str, object]:
+    direction = strategy_direction(idea.strategy)
+    if direction == "bullish":
+        invalidation = round(idea.spot * 0.97, 2)
+    elif direction == "bearish":
+        invalidation = round(idea.spot * 1.03, 2)
+    else:
+        invalidation = round(idea.spot, 2)
+    return {
+        "TicketID": f"LCM-{datetime.now().strftime('%Y%m%d%H%M%S')}-{idea.ticker}",
+        "Ticker": idea.ticker,
+        "Strategy": STRATEGY_LABELS[idea.strategy],
+        "StrategyKey": idea.strategy,
+        "Contracts": int(idea.contracts),
+        "EntryMark": round(float(idea.premium), 4),
+        "CurrentMark": round(float(idea.premium), 4),
+        "CloseMark": None,
+        "TargetReturnPct": 40.0,
+        "StopLossPct": 50.0,
+        "MaxHoldDays": 7,
+        "MaxSlippagePct": 5.0,
+        "EventExit": True,
+        "EventRiskNow": False,
+        "UnderlyingEntry": round(float(idea.spot), 2),
+        "UnderlyingNow": round(float(idea.spot), 2),
+        "InvalidationUnderlying": invalidation,
+        "Status": "Pending",
+        "ExitReason": "",
+        "CreatedAt": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "OpenedAt": "",
+        "ClosedAt": "",
+        "RiskLevel": idea.risk_level,
+    }
+
+
+def lifecycle_pnl(row: Dict[str, object], mark: float) -> float:
+    strategy = str(row.get("StrategyKey", ""))
+    entry = float(row.get("EntryMark", 0.0) or 0.0)
+    contracts = int(row.get("Contracts", 0) or 0)
+    if contracts <= 0 or entry <= 0:
+        return 0.0
+
+    long_strategies = {"naked_call", "naked_put", "bull_call_spread", "bear_put_spread"}
+    if strategy in long_strategies:
+        per_contract = (mark - entry) * 100.0
+    else:
+        per_contract = (entry - mark) * 100.0
+    return round(per_contract * contracts, 2)
+
+
+def evaluate_lifecycle_row(row: Dict[str, object]) -> Dict[str, object]:
+    updated = dict(row)
+    status = str(updated.get("Status", "Pending"))
+    if status != "Active":
+        return updated
+
+    strategy = str(updated.get("StrategyKey", ""))
+    direction = strategy_direction(strategy)
+
+    entry_mark = float(updated.get("EntryMark", 0.0) or 0.0)
+    current_mark = float(updated.get("CurrentMark", entry_mark) or entry_mark)
+    if entry_mark <= 0:
+        return updated
+
+    max_hold_days = int(updated.get("MaxHoldDays", 7) or 7)
+    target_return = float(updated.get("TargetReturnPct", 40.0) or 40.0)
+    stop_loss_pct = float(updated.get("StopLossPct", 50.0) or 50.0)
+
+    opened_at = str(updated.get("OpenedAt", "")).strip()
+    days_held = 0
+    if opened_at:
+        try:
+            open_ts = datetime.strptime(opened_at, "%Y-%m-%d %H:%M:%S")
+            days_held = max(0, (datetime.now() - open_ts).days)
+        except ValueError:
+            days_held = 0
+
+    long_strategies = {"naked_call", "naked_put", "bull_call_spread", "bear_put_spread"}
+    if strategy in long_strategies:
+        return_pct = ((current_mark - entry_mark) / entry_mark) * 100.0
+    else:
+        return_pct = ((entry_mark - current_mark) / entry_mark) * 100.0
+
+    trigger_reason = ""
+    if bool(updated.get("EventExit", False)) and bool(updated.get("EventRiskNow", False)):
+        trigger_reason = "Event exit trigger"
+    elif return_pct >= target_return:
+        trigger_reason = "Profit target hit"
+    elif return_pct <= -abs(stop_loss_pct):
+        trigger_reason = "Stop loss hit"
+    elif days_held >= max_hold_days:
+        trigger_reason = "Time stop hit"
+    else:
+        underlying_now = float(updated.get("UnderlyingNow", 0.0) or 0.0)
+        invalidation = float(updated.get("InvalidationUnderlying", 0.0) or 0.0)
+        if direction == "bullish" and underlying_now > 0 and underlying_now <= invalidation:
+            trigger_reason = "Underlying invalidation hit"
+        elif direction == "bearish" and underlying_now > 0 and underlying_now >= invalidation:
+            trigger_reason = "Underlying invalidation hit"
+
+    if trigger_reason:
+        updated["Status"] = "Closed"
+        updated["ExitReason"] = trigger_reason
+        updated["CloseMark"] = round(current_mark, 4)
+        updated["ClosedAt"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    return updated
+
+
+def lifecycle_review_df(rows: List[Dict[str, object]]) -> pd.DataFrame:
+    closed = [r for r in rows if str(r.get("Status", "")) == "Closed"]
+    out = []
+    for row in closed:
+        close_mark = float(row.get("CloseMark", row.get("CurrentMark", 0.0)) or 0.0)
+        pnl = lifecycle_pnl(row, close_mark)
+        entry = float(row.get("EntryMark", 0.0) or 0.0)
+        contracts = int(row.get("Contracts", 0) or 0)
+        notional = max(1.0, entry * 100.0 * max(1, contracts))
+        actual_return = round((pnl / notional) * 100.0, 2)
+        target = float(row.get("TargetReturnPct", 40.0) or 40.0)
+        gap = round(actual_return - target, 2)
+        note = "Met/exceeded plan." if gap >= 0 else "Missed plan; tighten entry/exit discipline."
+        out.append(
+            {
+                "TicketID": row.get("TicketID"),
+                "Ticker": row.get("Ticker"),
+                "Strategy": row.get("Strategy"),
+                "ExitReason": row.get("ExitReason"),
+                "PnL($)": pnl,
+                "ActualReturn(%)": actual_return,
+                "TargetReturn(%)": target,
+                "PlanVsActual(%)": gap,
+                "CoachNote": note,
+            }
+        )
+    return pd.DataFrame(out)
+
+
 def build_pdf_report_bytes(
     ideas: List[CandidateTrade],
     next_day: date,
@@ -1714,6 +1860,8 @@ def main() -> None:
         st.session_state.chat_last_error = ""
     if "journal_rows" not in st.session_state:
         st.session_state.journal_rows = []
+    if "lifecycle_rows" not in st.session_state:
+        st.session_state.lifecycle_rows = []
 
     if st.button("Analyze and Generate Next-Day Trades", type="primary"):
         ideas: List[CandidateTrade] = []
@@ -1850,6 +1998,13 @@ def main() -> None:
                     }
                 )
                 st.success("Added to journal")
+            if st.button("Create Lifecycle Plan", key=f"lifecycle_add_{idea.ticker}_{idea.strategy}_{idea.expiry}"):
+                new_row = lifecycle_row_from_idea(idea)
+                existing_ids = {str(r.get("TicketID", "")) for r in st.session_state.lifecycle_rows}
+                if new_row["TicketID"] in existing_ids:
+                    new_row["TicketID"] = f"{new_row['TicketID']}-X"
+                st.session_state.lifecycle_rows.append(new_row)
+                st.success("Lifecycle plan created")
 
     st.subheader("AI Memo")
     memo_col1, memo_col2, memo_col3 = st.columns([2, 2, 1])
@@ -2016,6 +2171,100 @@ def main() -> None:
         if st.button("Clear Journal", key="clear_journal_btn"):
             st.session_state.journal_rows = []
             st.rerun()
+
+    st.subheader("Trade Lifecycle Manager")
+    if not st.session_state.lifecycle_rows:
+        st.caption("No lifecycle plans yet. Click 'Create Lifecycle Plan' on any generated trade.")
+    else:
+        lifecycle_df = pd.DataFrame(st.session_state.lifecycle_rows)
+        editable_cols = [
+            "TicketID",
+            "Ticker",
+            "Strategy",
+            "Contracts",
+            "EntryMark",
+            "CurrentMark",
+            "TargetReturnPct",
+            "StopLossPct",
+            "MaxHoldDays",
+            "MaxSlippagePct",
+            "EventExit",
+            "EventRiskNow",
+            "UnderlyingEntry",
+            "UnderlyingNow",
+            "InvalidationUnderlying",
+            "Status",
+            "ExitReason",
+            "OpenedAt",
+            "ClosedAt",
+        ]
+        lifecycle_view = lifecycle_df[editable_cols].copy()
+        lifecycle_view = st.data_editor(
+            lifecycle_view,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            key="lifecycle_editor",
+        )
+
+        base_cols = [col for col in lifecycle_df.columns if col not in lifecycle_view.columns]
+        merged = lifecycle_view.copy()
+        for col in base_cols:
+            merged[col] = lifecycle_df[col].values
+        st.session_state.lifecycle_rows = merged.to_dict(orient="records")
+
+        lcol1, lcol2, lcol3 = st.columns(3)
+        with lcol1:
+            if st.button("Activate Pending Trades", key="activate_pending_lifecycle"):
+                updated = []
+                for row in st.session_state.lifecycle_rows:
+                    item = dict(row)
+                    if str(item.get("Status", "")) == "Pending":
+                        entry = float(item.get("EntryMark", 0.0) or 0.0)
+                        current = float(item.get("CurrentMark", entry) or entry)
+                        slip = float(item.get("MaxSlippagePct", 5.0) or 5.0)
+                        slippage_pct = abs((current - entry) / entry) * 100.0 if entry > 0 else 0.0
+                        if slippage_pct <= slip:
+                            item["Status"] = "Active"
+                            item["OpenedAt"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            item["ExitReason"] = ""
+                        else:
+                            item["ExitReason"] = "Activation blocked: slippage above max"
+                    updated.append(item)
+                st.session_state.lifecycle_rows = updated
+                st.rerun()
+        with lcol2:
+            if st.button("Run Rule Check", key="run_rule_check"):
+                st.session_state.lifecycle_rows = [evaluate_lifecycle_row(r) for r in st.session_state.lifecycle_rows]
+                st.rerun()
+        with lcol3:
+            ticket_choices = [str(r.get("TicketID")) for r in st.session_state.lifecycle_rows]
+            close_ticket = st.selectbox("Manual Close Ticket", ticket_choices, key="manual_close_ticket")
+            if st.button("Close Selected", key="manual_close_btn"):
+                updated = []
+                for row in st.session_state.lifecycle_rows:
+                    item = dict(row)
+                    if str(item.get("TicketID")) == close_ticket and str(item.get("Status")) in {"Active", "Pending"}:
+                        item["Status"] = "Closed"
+                        item["ExitReason"] = "Manual close"
+                        item["CloseMark"] = float(item.get("CurrentMark", item.get("EntryMark", 0.0)) or 0.0)
+                        item["ClosedAt"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    updated.append(item)
+                st.session_state.lifecycle_rows = updated
+                st.rerun()
+
+        review_df = lifecycle_review_df(st.session_state.lifecycle_rows)
+        st.markdown("Post-Trade Review")
+        if review_df.empty:
+            st.caption("No closed trades yet for review.")
+        else:
+            st.dataframe(review_df, use_container_width=True, height=220)
+            st.download_button(
+                "Download Lifecycle Review (CSV)",
+                data=review_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"lifecycle_review_{result_next_day}.csv",
+                mime="text/csv",
+            )
 
     st.subheader("Trade Ticket Export")
     st.dataframe(tickets_df, use_container_width=True, height=320)
