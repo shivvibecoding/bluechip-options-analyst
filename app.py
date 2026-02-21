@@ -772,6 +772,179 @@ def http_get_json(url: str, headers: Dict[str, str], timeout: int = 25) -> Dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
+def supabase_config() -> Tuple[str, str]:
+    try:
+        url = str(st.secrets.get("SUPABASE_URL", "")).strip().rstrip("/")
+        anon = str(st.secrets.get("SUPABASE_ANON_KEY", "")).strip()
+        return url, anon
+    except Exception:
+        return "", ""
+
+
+def supabase_available() -> bool:
+    url, anon = supabase_config()
+    return bool(url and anon)
+
+
+def supabase_request(
+    endpoint: str,
+    method: str = "GET",
+    payload: Optional[Dict] = None,
+    access_token: str = "",
+    auth_api: bool = False,
+    query: str = "",
+) -> Tuple[Optional[Dict], Optional[str]]:
+    base_url, anon_key = supabase_config()
+    if not base_url or not anon_key:
+        return None, "Supabase is not configured. Add SUPABASE_URL and SUPABASE_ANON_KEY in Streamlit secrets."
+
+    base_path = "/auth/v1" if auth_api else "/rest/v1"
+    url = f"{base_url}{base_path}/{endpoint}"
+    if query:
+        url = f"{url}?{query}"
+
+    headers = {
+        "apikey": anon_key,
+        "Content-Type": "application/json",
+    }
+    headers["Authorization"] = f"Bearer {access_token or anon_key}"
+    if not auth_api:
+        headers["Prefer"] = "return=representation"
+
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with request.urlopen(req, timeout=30) as resp:
+            text = resp.read().decode("utf-8")
+            if not text:
+                return {}, None
+            parsed = json.loads(text)
+            return parsed, None
+    except error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8")
+            parsed = json.loads(body)
+            msg = parsed.get("msg") or parsed.get("message") or body
+        except Exception:
+            msg = str(exc)
+        return None, f"Supabase HTTP {exc.code}: {msg}"
+    except Exception as exc:
+        return None, f"Supabase request failed: {type(exc).__name__}: {str(exc)}"
+
+
+def supabase_sign_up(email: str, password: str) -> Optional[str]:
+    _, err = supabase_request(
+        endpoint="signup",
+        method="POST",
+        payload={"email": email, "password": password},
+        auth_api=True,
+    )
+    return err
+
+
+def supabase_sign_in(email: str, password: str) -> Tuple[Optional[Dict], Optional[str]]:
+    return supabase_request(
+        endpoint="token",
+        method="POST",
+        payload={"email": email, "password": password},
+        auth_api=True,
+        query="grant_type=password",
+    )
+
+
+def supabase_get_user(access_token: str) -> Tuple[Optional[Dict], Optional[str]]:
+    return supabase_request(endpoint="user", method="GET", access_token=access_token, auth_api=True)
+
+
+def supabase_get_profile(access_token: str, user_id: str) -> Tuple[Optional[Dict], Optional[str]]:
+    data, err = supabase_request(
+        endpoint="profiles",
+        method="GET",
+        access_token=access_token,
+        query=f"select=*&id=eq.{user_id}&limit=1",
+    )
+    if err:
+        return None, err
+    if isinstance(data, list) and data:
+        return data[0], None
+    return {}, None
+
+
+def supabase_upsert_profile(access_token: str, payload: Dict) -> Optional[str]:
+    _, err = supabase_request(
+        endpoint="profiles",
+        method="POST",
+        access_token=access_token,
+        query="on_conflict=id",
+        payload=payload,
+    )
+    return err
+
+
+def supabase_list_watchlists(access_token: str) -> Tuple[List[Dict], Optional[str]]:
+    data, err = supabase_request(
+        endpoint="watchlists",
+        method="GET",
+        access_token=access_token,
+        query="select=id,name,created_at&order=created_at.desc",
+    )
+    if err:
+        return [], err
+    return data if isinstance(data, list) else [], None
+
+
+def supabase_create_watchlist(access_token: str, name: str, user_id: str) -> Optional[str]:
+    _, err = supabase_request(
+        endpoint="watchlists",
+        method="POST",
+        access_token=access_token,
+        payload={"name": name, "user_id": user_id},
+    )
+    return err
+
+
+def supabase_delete_watchlist(access_token: str, watchlist_id: str) -> Optional[str]:
+    _, err = supabase_request(
+        endpoint="watchlists",
+        method="DELETE",
+        access_token=access_token,
+        query=f"id=eq.{watchlist_id}",
+    )
+    return err
+
+
+def supabase_list_watchlist_items(access_token: str, watchlist_id: str) -> Tuple[List[Dict], Optional[str]]:
+    data, err = supabase_request(
+        endpoint="watchlist_items",
+        method="GET",
+        access_token=access_token,
+        query=f"select=id,symbol,note,added_at&watchlist_id=eq.{watchlist_id}&order=added_at.desc",
+    )
+    if err:
+        return [], err
+    return data if isinstance(data, list) else [], None
+
+
+def supabase_add_watchlist_item(access_token: str, watchlist_id: str, symbol: str, note: str = "") -> Optional[str]:
+    _, err = supabase_request(
+        endpoint="watchlist_items",
+        method="POST",
+        access_token=access_token,
+        payload={"watchlist_id": watchlist_id, "symbol": symbol, "note": note},
+    )
+    return err
+
+
+def supabase_remove_watchlist_item(access_token: str, watchlist_id: str, symbol: str) -> Optional[str]:
+    _, err = supabase_request(
+        endpoint="watchlist_items",
+        method="DELETE",
+        access_token=access_token,
+        query=f"watchlist_id=eq.{watchlist_id}&symbol=eq.{symbol}",
+    )
+    return err
+
+
 def fetch_tradier_expiries(symbol: str, tradier_token: str) -> List[str]:
     base = "https://api.tradier.com/v1/markets/options/expirations"
     query = urlencode({"symbol": symbol, "includeAllRoots": "true", "strikes": "false"})
@@ -1782,6 +1955,205 @@ def main() -> None:
     next_day = next_business_day(as_of)
     render_header(next_day)
 
+    if "auth_access_token" not in st.session_state:
+        st.session_state.auth_access_token = ""
+    if "auth_user" not in st.session_state:
+        st.session_state.auth_user = {}
+    if "watchlists_cache" not in st.session_state:
+        st.session_state.watchlists_cache = []
+    if "watchlist_items_cache" not in st.session_state:
+        st.session_state.watchlist_items_cache = []
+
+    st.subheader("Account & Watchlists")
+    if not supabase_available():
+        st.info("Supabase not configured yet. App runs in guest mode. Add SUPABASE_URL and SUPABASE_ANON_KEY to enable signup/profile/watchlists.")
+        is_logged_in = False
+    else:
+        auth_tab, watch_tab = st.tabs(["Account", "Watchlists"])
+        is_logged_in = bool(st.session_state.auth_access_token)
+        if is_logged_in and not st.session_state.auth_user:
+            user, uerr = supabase_get_user(st.session_state.auth_access_token)
+            if not uerr and user:
+                st.session_state.auth_user = user
+
+        with auth_tab:
+            if not is_logged_in:
+                a1, a2 = st.columns(2)
+                with a1:
+                    auth_email = st.text_input("Email", key="auth_email")
+                with a2:
+                    auth_password = st.text_input("Password", type="password", key="auth_password")
+                b1, b2 = st.columns(2)
+                with b1:
+                    if st.button("Sign Up", key="signup_btn"):
+                        err = supabase_sign_up(auth_email.strip(), auth_password)
+                        if err:
+                            st.error(err)
+                        else:
+                            st.success("Sign-up submitted. If email confirmation is enabled, verify then log in.")
+                with b2:
+                    if st.button("Log In", key="login_btn"):
+                        data, err = supabase_sign_in(auth_email.strip(), auth_password)
+                        if err:
+                            st.error(err)
+                        else:
+                            token = str(data.get("access_token", ""))
+                            st.session_state.auth_access_token = token
+                            user, uerr = supabase_get_user(token)
+                            if uerr:
+                                st.error(uerr)
+                            else:
+                                st.session_state.auth_user = user or {}
+                                st.success("Logged in.")
+                                st.rerun()
+            else:
+                user_email = st.session_state.auth_user.get("email", "Unknown")
+                user_id = st.session_state.auth_user.get("id", "")
+                st.caption(f"Logged in as: {user_email}")
+                if st.button("Log Out", key="logout_btn"):
+                    st.session_state.auth_access_token = ""
+                    st.session_state.auth_user = {}
+                    st.session_state.watchlists_cache = []
+                    st.session_state.watchlist_items_cache = []
+                    st.rerun()
+
+                profile_data, perr = supabase_get_profile(st.session_state.auth_access_token, user_id)
+                if perr:
+                    st.warning(perr)
+                p1, p2, p3 = st.columns(3)
+                with p1:
+                    full_name = st.text_input("Full Name", value=str(profile_data.get("full_name", "")), key="profile_full_name")
+                with p2:
+                    experience = st.selectbox(
+                        "Options Experience",
+                        ["beginner", "intermediate", "advanced"],
+                        index=["beginner", "intermediate", "advanced"].index(
+                            str(profile_data.get("experience_level", "beginner"))
+                        )
+                        if str(profile_data.get("experience_level", "beginner")) in ["beginner", "intermediate", "advanced"]
+                        else 0,
+                        key="profile_experience",
+                    )
+                with p3:
+                    default_risk_pref = st.selectbox(
+                        "Default Risk Preference",
+                        ["conservative", "moderate"],
+                        index=0 if str(profile_data.get("default_risk", "conservative")) == "conservative" else 1,
+                        key="profile_risk_pref",
+                    )
+                if st.button("Save Profile", key="save_profile_btn"):
+                    err = supabase_upsert_profile(
+                        st.session_state.auth_access_token,
+                        {
+                            "id": user_id,
+                            "email": user_email,
+                            "full_name": full_name.strip(),
+                            "experience_level": experience,
+                            "default_risk": default_risk_pref,
+                            "updated_at": datetime.now().isoformat(),
+                        },
+                    )
+                    if err:
+                        st.error(err)
+                    else:
+                        st.success("Profile saved")
+
+        with watch_tab:
+            if not is_logged_in:
+                st.info("Log in to create and manage watchlists.")
+            else:
+                token = st.session_state.auth_access_token
+                if st.button("Refresh Watchlists", key="refresh_watchlists_btn"):
+                    watchlists, err = supabase_list_watchlists(token)
+                    if err:
+                        st.error(err)
+                    else:
+                        st.session_state.watchlists_cache = watchlists
+                if not st.session_state.watchlists_cache:
+                    watchlists, err = supabase_list_watchlists(token)
+                    if not err:
+                        st.session_state.watchlists_cache = watchlists
+
+                w1, w2 = st.columns(2)
+                with w1:
+                    new_watchlist_name = st.text_input("New Watchlist Name", key="new_watchlist_name")
+                with w2:
+                    st.write("")
+                    st.write("")
+                    if st.button("Create Watchlist", key="create_watchlist_btn"):
+                        err = supabase_create_watchlist(token, new_watchlist_name.strip(), st.session_state.auth_user.get("id", ""))
+                        if err:
+                            st.error(err)
+                        else:
+                            st.success("Watchlist created")
+                            st.session_state.watchlists_cache, _ = supabase_list_watchlists(token)
+                            st.rerun()
+
+                wl_options = st.session_state.watchlists_cache
+                wl_labels = [f"{w.get('name')} ({w.get('id')})" for w in wl_options]
+                selected_label = st.selectbox(
+                    "Select Watchlist",
+                    wl_labels if wl_labels else [""],
+                    index=0,
+                    key="selected_watchlist_label",
+                )
+                selected_watchlist_id = ""
+                if selected_label:
+                    selected_watchlist_id = selected_label.split("(")[-1].replace(")", "").strip()
+
+                if selected_watchlist_id:
+                    items, err = supabase_list_watchlist_items(token, selected_watchlist_id)
+                    if err:
+                        st.error(err)
+                    else:
+                        st.session_state.watchlist_items_cache = items
+
+                    item_symbols = [str(x.get("symbol", "")).upper() for x in st.session_state.watchlist_items_cache]
+                    st.caption("Symbols: " + (", ".join(item_symbols) if item_symbols else "No symbols yet"))
+
+                    i1, i2 = st.columns(2)
+                    with i1:
+                        add_symbol = st.text_input("Add Symbol", key="add_watchlist_symbol")
+                    with i2:
+                        add_note = st.text_input("Symbol Note (optional)", key="add_watchlist_note")
+                    if st.button("Add Symbol To Watchlist", key="add_symbol_btn"):
+                        symbol = add_symbol.strip().upper()
+                        if not symbol:
+                            st.warning("Enter a symbol")
+                        else:
+                            err = supabase_add_watchlist_item(token, selected_watchlist_id, symbol, add_note.strip())
+                            if err:
+                                st.error(err)
+                            else:
+                                st.success(f"Added {symbol}")
+                                st.session_state.watchlist_items_cache, _ = supabase_list_watchlist_items(token, selected_watchlist_id)
+                                st.rerun()
+
+                    remove_symbol = st.selectbox(
+                        "Remove Symbol",
+                        item_symbols if item_symbols else [""],
+                        key="remove_watchlist_symbol",
+                    )
+                    if st.button("Remove Symbol From Watchlist", key="remove_symbol_btn") and remove_symbol:
+                        err = supabase_remove_watchlist_item(token, selected_watchlist_id, remove_symbol)
+                        if err:
+                            st.error(err)
+                        else:
+                            st.success(f"Removed {remove_symbol}")
+                            st.session_state.watchlist_items_cache, _ = supabase_list_watchlist_items(token, selected_watchlist_id)
+                            st.rerun()
+
+                    if st.button("Delete Watchlist", key="delete_watchlist_btn"):
+                        err = supabase_delete_watchlist(token, selected_watchlist_id)
+                        if err:
+                            st.error(err)
+                        else:
+                            st.success("Watchlist deleted")
+                            st.session_state.watchlists_cache, _ = supabase_list_watchlists(token)
+                            st.session_state.watchlist_items_cache = []
+                            st.rerun()
+
+    st.divider()
     st.subheader("Trade Setup")
     st.caption("All filters are visible here for better mobile usability.")
 
@@ -1797,11 +2169,29 @@ def main() -> None:
             step=1000.0,
         )
 
-    tickers = st.multiselect(
-        "Blue-Chip Tech Universe",
-        BLUE_CHIP_TECH,
-        default=["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL"],
+    watchlist_symbols = [str(x.get("symbol", "")).upper() for x in st.session_state.get("watchlist_items_cache", [])]
+    use_watchlist_for_analysis = st.checkbox(
+        "Use selected watchlist symbols for analysis",
+        value=bool(watchlist_symbols),
+        key="use_watchlist_for_analysis",
     )
+
+    if use_watchlist_for_analysis and watchlist_symbols:
+        tickers = sorted(set([s for s in watchlist_symbols if s]))
+        st.multiselect(
+            "Watchlist Symbols (Active)",
+            tickers,
+            default=tickers,
+            disabled=True,
+            key="watchlist_symbols_preview",
+        )
+    else:
+        manual_universe = sorted(set(BLUE_CHIP_TECH + watchlist_symbols))
+        tickers = st.multiselect(
+            "Blue-Chip / Manual Universe",
+            manual_universe,
+            default=["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL"],
+        )
 
     allowed_strategy_labels = st.multiselect(
         "Allowed Strategies",

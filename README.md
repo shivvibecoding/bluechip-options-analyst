@@ -127,3 +127,142 @@ Options trading carries significant risk, including total loss of premium (long 
   - Auto-update `EventRiskNow` from upcoming earnings dates
   - Optional macro date CSV input (e.g., FOMC/CPI dates)
   - Configurable event window days
+
+## Supabase setup (signup, profile, watchlists)
+
+This app now supports:
+- user signup/login
+- profile storage
+- watchlist CRUD and analysis from selected watchlist symbols
+
+### 1) Create free Supabase project
+
+- Go to Supabase and create a new project (free tier is enough for POC).
+- In project settings, copy:
+  - Project URL
+  - anon/public API key
+
+### 2) Run SQL (Supabase SQL editor)
+
+```sql
+create table if not exists public.profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  email text,
+  full_name text default '',
+  experience_level text default 'beginner',
+  default_risk text default 'conservative',
+  updated_at timestamptz default now()
+);
+
+create table if not exists public.watchlists (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  name text not null,
+  created_at timestamptz default now()
+);
+
+create table if not exists public.watchlist_items (
+  id uuid primary key default gen_random_uuid(),
+  watchlist_id uuid not null references public.watchlists(id) on delete cascade,
+  symbol text not null,
+  note text default '',
+  added_at timestamptz default now()
+);
+
+create unique index if not exists watchlist_items_unique_symbol
+on public.watchlist_items (watchlist_id, symbol);
+
+alter table public.profiles enable row level security;
+alter table public.watchlists enable row level security;
+alter table public.watchlist_items enable row level security;
+
+-- profiles policies
+drop policy if exists "profiles_select_own" on public.profiles;
+create policy "profiles_select_own"
+on public.profiles for select
+using (auth.uid() = id);
+
+drop policy if exists "profiles_insert_own" on public.profiles;
+create policy "profiles_insert_own"
+on public.profiles for insert
+with check (auth.uid() = id);
+
+drop policy if exists "profiles_update_own" on public.profiles;
+create policy "profiles_update_own"
+on public.profiles for update
+using (auth.uid() = id);
+
+-- watchlists policies
+drop policy if exists "watchlists_select_own" on public.watchlists;
+create policy "watchlists_select_own"
+on public.watchlists for select
+using (auth.uid() = user_id);
+
+drop policy if exists "watchlists_insert_own" on public.watchlists;
+create policy "watchlists_insert_own"
+on public.watchlists for insert
+with check (auth.uid() = user_id);
+
+drop policy if exists "watchlists_delete_own" on public.watchlists;
+create policy "watchlists_delete_own"
+on public.watchlists for delete
+using (auth.uid() = user_id);
+
+-- watchlist_items policies
+drop policy if exists "watchlist_items_select_own" on public.watchlist_items;
+create policy "watchlist_items_select_own"
+on public.watchlist_items for select
+using (
+  exists (
+    select 1 from public.watchlists w
+    where w.id = watchlist_items.watchlist_id
+      and w.user_id = auth.uid()
+  )
+);
+
+drop policy if exists "watchlist_items_insert_own" on public.watchlist_items;
+create policy "watchlist_items_insert_own"
+on public.watchlist_items for insert
+with check (
+  exists (
+    select 1 from public.watchlists w
+    where w.id = watchlist_items.watchlist_id
+      and w.user_id = auth.uid()
+  )
+);
+
+drop policy if exists "watchlist_items_delete_own" on public.watchlist_items;
+create policy "watchlist_items_delete_own"
+on public.watchlist_items for delete
+using (
+  exists (
+    select 1 from public.watchlists w
+    where w.id = watchlist_items.watchlist_id
+      and w.user_id = auth.uid()
+  )
+);
+```
+
+### 3) Add Streamlit secrets
+
+In Streamlit Cloud -> Manage app -> Secrets:
+
+```toml
+SUPABASE_URL="https://YOUR_PROJECT_ID.supabase.co"
+SUPABASE_ANON_KEY="YOUR_SUPABASE_ANON_KEY"
+OPENAI_API_KEY="sk-..."
+TRADIER_TOKEN="..."
+```
+
+### 4) Auth settings
+
+- In Supabase Auth settings, enable Email/Password provider.
+- If email confirmation is ON, users must verify email before first login.
+
+### 5) In-app usage
+
+- Open `Account & Watchlists` section.
+- Sign up / log in.
+- Save profile fields.
+- Create watchlist, add symbols, then enable:
+  - `Use selected watchlist symbols for analysis`
