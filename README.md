@@ -266,3 +266,8 @@ TRADIER_TOKEN="..."
 - Save profile fields.
 - Create watchlist, add symbols, then enable:
   - `Use selected watchlist symbols for analysis`
+
+## Setup modes
+
+- `Basic` mode: streamlined setup with safe defaults (all strategies enabled, earnings filter on, provider auto, standard liquidity guardrails).
+- `Advanced` mode: full control over strategy selection, provider, earnings rules, liquidity thresholds, and sizing knobs.

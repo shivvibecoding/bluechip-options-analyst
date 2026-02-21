@@ -1964,198 +1964,207 @@ def main() -> None:
     if "watchlist_items_cache" not in st.session_state:
         st.session_state.watchlist_items_cache = []
 
-    st.subheader("Account & Watchlists")
     if not supabase_available():
-        st.info("Supabase not configured yet. App runs in guest mode. Add SUPABASE_URL and SUPABASE_ANON_KEY to enable signup/profile/watchlists.")
-        is_logged_in = False
-    else:
-        auth_tab, watch_tab = st.tabs(["Account", "Watchlists"])
-        is_logged_in = bool(st.session_state.auth_access_token)
-        if is_logged_in and not st.session_state.auth_user:
-            user, uerr = supabase_get_user(st.session_state.auth_access_token)
-            if not uerr and user:
-                st.session_state.auth_user = user
+        st.error("Supabase is required. Add SUPABASE_URL and SUPABASE_ANON_KEY in Streamlit secrets to continue.")
+        return
 
-        with auth_tab:
-            if not is_logged_in:
-                a1, a2 = st.columns(2)
-                with a1:
-                    auth_email = st.text_input("Email", key="auth_email")
-                with a2:
-                    auth_password = st.text_input("Password", type="password", key="auth_password")
-                b1, b2 = st.columns(2)
-                with b1:
-                    if st.button("Sign Up", key="signup_btn"):
-                        err = supabase_sign_up(auth_email.strip(), auth_password)
-                        if err:
-                            st.error(err)
-                        else:
-                            st.success("Sign-up submitted. If email confirmation is enabled, verify then log in.")
-                with b2:
-                    if st.button("Log In", key="login_btn"):
-                        data, err = supabase_sign_in(auth_email.strip(), auth_password)
-                        if err:
-                            st.error(err)
-                        else:
-                            token = str(data.get("access_token", ""))
-                            st.session_state.auth_access_token = token
-                            user, uerr = supabase_get_user(token)
-                            if uerr:
-                                st.error(uerr)
-                            else:
-                                st.session_state.auth_user = user or {}
-                                st.success("Logged in.")
-                                st.rerun()
+    is_logged_in = bool(st.session_state.auth_access_token)
+    if is_logged_in and not st.session_state.auth_user:
+        user, uerr = supabase_get_user(st.session_state.auth_access_token)
+        if uerr:
+            st.warning(uerr)
+        elif user:
+            st.session_state.auth_user = user
+
+    if not is_logged_in:
+        st.subheader("Sign In")
+        st.caption("Log in to access your profile, watchlists, and trade workspace.")
+        sign_in_tab, sign_up_tab = st.tabs(["Log In", "Create Account"])
+
+        with sign_in_tab:
+            a1, a2 = st.columns(2)
+            with a1:
+                auth_email = st.text_input("Email", key="auth_email")
+            with a2:
+                auth_password = st.text_input("Password", type="password", key="auth_password")
+            if st.button("Log In", key="login_btn"):
+                data, err = supabase_sign_in(auth_email.strip(), auth_password)
+                if err:
+                    st.error(err)
+                else:
+                    token = str(data.get("access_token", ""))
+                    st.session_state.auth_access_token = token
+                    user, uerr = supabase_get_user(token)
+                    if uerr:
+                        st.error(uerr)
+                    else:
+                        st.session_state.auth_user = user or {}
+                        st.success("Logged in.")
+                        st.rerun()
+
+        with sign_up_tab:
+            s1, s2 = st.columns(2)
+            with s1:
+                signup_email = st.text_input("Email", key="signup_email")
+            with s2:
+                signup_password = st.text_input("Password", type="password", key="signup_password")
+            if st.button("Create Account", key="signup_btn"):
+                err = supabase_sign_up(signup_email.strip(), signup_password)
+                if err:
+                    st.error(err)
+                else:
+                    st.success("Sign-up submitted. Verify email if required, then log in.")
+        return
+
+    st.subheader("Account & Watchlists")
+    user_email = st.session_state.auth_user.get("email", "Unknown")
+    user_id = st.session_state.auth_user.get("id", "")
+    st.caption(f"Logged in as: {user_email}")
+    if st.button("Log Out", key="logout_btn"):
+        st.session_state.auth_access_token = ""
+        st.session_state.auth_user = {}
+        st.session_state.watchlists_cache = []
+        st.session_state.watchlist_items_cache = []
+        st.rerun()
+
+    profile_tab, watch_tab = st.tabs(["Profile", "Watchlists"])
+
+    with profile_tab:
+        profile_data, perr = supabase_get_profile(st.session_state.auth_access_token, user_id)
+        if perr:
+            st.warning(perr)
+        p1, p2, p3 = st.columns(3)
+        with p1:
+            full_name = st.text_input("Full Name", value=str(profile_data.get("full_name", "")), key="profile_full_name")
+        with p2:
+            experience = st.selectbox(
+                "Options Experience",
+                ["beginner", "intermediate", "advanced"],
+                index=["beginner", "intermediate", "advanced"].index(str(profile_data.get("experience_level", "beginner")))
+                if str(profile_data.get("experience_level", "beginner")) in ["beginner", "intermediate", "advanced"]
+                else 0,
+                key="profile_experience",
+            )
+        with p3:
+            default_risk_pref = st.selectbox(
+                "Default Risk Preference",
+                ["conservative", "moderate"],
+                index=0 if str(profile_data.get("default_risk", "conservative")) == "conservative" else 1,
+                key="profile_risk_pref",
+            )
+        if st.button("Save Profile", key="save_profile_btn"):
+            err = supabase_upsert_profile(
+                st.session_state.auth_access_token,
+                {
+                    "id": user_id,
+                    "email": user_email,
+                    "full_name": full_name.strip(),
+                    "experience_level": experience,
+                    "default_risk": default_risk_pref,
+                    "updated_at": datetime.now().isoformat(),
+                },
+            )
+            if err:
+                st.error(err)
             else:
-                user_email = st.session_state.auth_user.get("email", "Unknown")
-                user_id = st.session_state.auth_user.get("id", "")
-                st.caption(f"Logged in as: {user_email}")
-                if st.button("Log Out", key="logout_btn"):
-                    st.session_state.auth_access_token = ""
-                    st.session_state.auth_user = {}
-                    st.session_state.watchlists_cache = []
-                    st.session_state.watchlist_items_cache = []
+                st.success("Profile saved")
+
+    with watch_tab:
+        token = st.session_state.auth_access_token
+        if st.button("Refresh Watchlists", key="refresh_watchlists_btn"):
+            watchlists, err = supabase_list_watchlists(token)
+            if err:
+                st.error(err)
+            else:
+                st.session_state.watchlists_cache = watchlists
+        if not st.session_state.watchlists_cache:
+            watchlists, err = supabase_list_watchlists(token)
+            if not err:
+                st.session_state.watchlists_cache = watchlists
+
+        w1, w2 = st.columns(2)
+        with w1:
+            new_watchlist_name = st.text_input("New Watchlist Name", key="new_watchlist_name")
+        with w2:
+            st.write("")
+            st.write("")
+            if st.button("Create Watchlist", key="create_watchlist_btn"):
+                err = supabase_create_watchlist(token, new_watchlist_name.strip(), st.session_state.auth_user.get("id", ""))
+                if err:
+                    st.error(err)
+                else:
+                    st.success("Watchlist created")
+                    st.session_state.watchlists_cache, _ = supabase_list_watchlists(token)
                     st.rerun()
 
-                profile_data, perr = supabase_get_profile(st.session_state.auth_access_token, user_id)
-                if perr:
-                    st.warning(perr)
-                p1, p2, p3 = st.columns(3)
-                with p1:
-                    full_name = st.text_input("Full Name", value=str(profile_data.get("full_name", "")), key="profile_full_name")
-                with p2:
-                    experience = st.selectbox(
-                        "Options Experience",
-                        ["beginner", "intermediate", "advanced"],
-                        index=["beginner", "intermediate", "advanced"].index(
-                            str(profile_data.get("experience_level", "beginner"))
-                        )
-                        if str(profile_data.get("experience_level", "beginner")) in ["beginner", "intermediate", "advanced"]
-                        else 0,
-                        key="profile_experience",
-                    )
-                with p3:
-                    default_risk_pref = st.selectbox(
-                        "Default Risk Preference",
-                        ["conservative", "moderate"],
-                        index=0 if str(profile_data.get("default_risk", "conservative")) == "conservative" else 1,
-                        key="profile_risk_pref",
-                    )
-                if st.button("Save Profile", key="save_profile_btn"):
-                    err = supabase_upsert_profile(
-                        st.session_state.auth_access_token,
-                        {
-                            "id": user_id,
-                            "email": user_email,
-                            "full_name": full_name.strip(),
-                            "experience_level": experience,
-                            "default_risk": default_risk_pref,
-                            "updated_at": datetime.now().isoformat(),
-                        },
-                    )
-                    if err:
-                        st.error(err)
-                    else:
-                        st.success("Profile saved")
+        wl_options = st.session_state.watchlists_cache
+        wl_labels = [f"{w.get('name')} ({w.get('id')})" for w in wl_options]
+        selected_label = st.selectbox(
+            "Select Watchlist",
+            wl_labels if wl_labels else [""],
+            index=0,
+            key="selected_watchlist_label",
+        )
+        selected_watchlist_id = ""
+        if selected_label:
+            selected_watchlist_id = selected_label.split("(")[-1].replace(")", "").strip()
 
-        with watch_tab:
-            if not is_logged_in:
-                st.info("Log in to create and manage watchlists.")
+        if selected_watchlist_id:
+            items, err = supabase_list_watchlist_items(token, selected_watchlist_id)
+            if err:
+                st.error(err)
             else:
-                token = st.session_state.auth_access_token
-                if st.button("Refresh Watchlists", key="refresh_watchlists_btn"):
-                    watchlists, err = supabase_list_watchlists(token)
+                st.session_state.watchlist_items_cache = items
+
+            item_symbols = [str(x.get("symbol", "")).upper() for x in st.session_state.watchlist_items_cache]
+            st.caption("Symbols: " + (", ".join(item_symbols) if item_symbols else "No symbols yet"))
+
+            i1, i2 = st.columns(2)
+            with i1:
+                add_symbol = st.text_input("Add Symbol", key="add_watchlist_symbol")
+            with i2:
+                add_note = st.text_input("Symbol Note (optional)", key="add_watchlist_note")
+            if st.button("Add Symbol To Watchlist", key="add_symbol_btn"):
+                symbol = add_symbol.strip().upper()
+                if not symbol:
+                    st.warning("Enter a symbol")
+                else:
+                    err = supabase_add_watchlist_item(token, selected_watchlist_id, symbol, add_note.strip())
                     if err:
                         st.error(err)
                     else:
-                        st.session_state.watchlists_cache = watchlists
-                if not st.session_state.watchlists_cache:
-                    watchlists, err = supabase_list_watchlists(token)
-                    if not err:
-                        st.session_state.watchlists_cache = watchlists
+                        st.success(f"Added {symbol}")
+                        st.session_state.watchlist_items_cache, _ = supabase_list_watchlist_items(token, selected_watchlist_id)
+                        st.rerun()
 
-                w1, w2 = st.columns(2)
-                with w1:
-                    new_watchlist_name = st.text_input("New Watchlist Name", key="new_watchlist_name")
-                with w2:
-                    st.write("")
-                    st.write("")
-                    if st.button("Create Watchlist", key="create_watchlist_btn"):
-                        err = supabase_create_watchlist(token, new_watchlist_name.strip(), st.session_state.auth_user.get("id", ""))
-                        if err:
-                            st.error(err)
-                        else:
-                            st.success("Watchlist created")
-                            st.session_state.watchlists_cache, _ = supabase_list_watchlists(token)
-                            st.rerun()
+            remove_symbol = st.selectbox(
+                "Remove Symbol",
+                item_symbols if item_symbols else [""],
+                key="remove_watchlist_symbol",
+            )
+            if st.button("Remove Symbol From Watchlist", key="remove_symbol_btn") and remove_symbol:
+                err = supabase_remove_watchlist_item(token, selected_watchlist_id, remove_symbol)
+                if err:
+                    st.error(err)
+                else:
+                    st.success(f"Removed {remove_symbol}")
+                    st.session_state.watchlist_items_cache, _ = supabase_list_watchlist_items(token, selected_watchlist_id)
+                    st.rerun()
 
-                wl_options = st.session_state.watchlists_cache
-                wl_labels = [f"{w.get('name')} ({w.get('id')})" for w in wl_options]
-                selected_label = st.selectbox(
-                    "Select Watchlist",
-                    wl_labels if wl_labels else [""],
-                    index=0,
-                    key="selected_watchlist_label",
-                )
-                selected_watchlist_id = ""
-                if selected_label:
-                    selected_watchlist_id = selected_label.split("(")[-1].replace(")", "").strip()
-
-                if selected_watchlist_id:
-                    items, err = supabase_list_watchlist_items(token, selected_watchlist_id)
-                    if err:
-                        st.error(err)
-                    else:
-                        st.session_state.watchlist_items_cache = items
-
-                    item_symbols = [str(x.get("symbol", "")).upper() for x in st.session_state.watchlist_items_cache]
-                    st.caption("Symbols: " + (", ".join(item_symbols) if item_symbols else "No symbols yet"))
-
-                    i1, i2 = st.columns(2)
-                    with i1:
-                        add_symbol = st.text_input("Add Symbol", key="add_watchlist_symbol")
-                    with i2:
-                        add_note = st.text_input("Symbol Note (optional)", key="add_watchlist_note")
-                    if st.button("Add Symbol To Watchlist", key="add_symbol_btn"):
-                        symbol = add_symbol.strip().upper()
-                        if not symbol:
-                            st.warning("Enter a symbol")
-                        else:
-                            err = supabase_add_watchlist_item(token, selected_watchlist_id, symbol, add_note.strip())
-                            if err:
-                                st.error(err)
-                            else:
-                                st.success(f"Added {symbol}")
-                                st.session_state.watchlist_items_cache, _ = supabase_list_watchlist_items(token, selected_watchlist_id)
-                                st.rerun()
-
-                    remove_symbol = st.selectbox(
-                        "Remove Symbol",
-                        item_symbols if item_symbols else [""],
-                        key="remove_watchlist_symbol",
-                    )
-                    if st.button("Remove Symbol From Watchlist", key="remove_symbol_btn") and remove_symbol:
-                        err = supabase_remove_watchlist_item(token, selected_watchlist_id, remove_symbol)
-                        if err:
-                            st.error(err)
-                        else:
-                            st.success(f"Removed {remove_symbol}")
-                            st.session_state.watchlist_items_cache, _ = supabase_list_watchlist_items(token, selected_watchlist_id)
-                            st.rerun()
-
-                    if st.button("Delete Watchlist", key="delete_watchlist_btn"):
-                        err = supabase_delete_watchlist(token, selected_watchlist_id)
-                        if err:
-                            st.error(err)
-                        else:
-                            st.success("Watchlist deleted")
-                            st.session_state.watchlists_cache, _ = supabase_list_watchlists(token)
-                            st.session_state.watchlist_items_cache = []
-                            st.rerun()
+            if st.button("Delete Watchlist", key="delete_watchlist_btn"):
+                err = supabase_delete_watchlist(token, selected_watchlist_id)
+                if err:
+                    st.error(err)
+                else:
+                    st.success("Watchlist deleted")
+                    st.session_state.watchlists_cache, _ = supabase_list_watchlists(token)
+                    st.session_state.watchlist_items_cache = []
+                    st.rerun()
 
     st.divider()
     st.subheader("Trade Setup")
     st.caption("All filters are visible here for better mobile usability.")
+    setup_mode = st.radio("Mode", ["Basic", "Advanced"], horizontal=True, index=0, key="setup_mode")
 
     risk_col, portfolio_col = st.columns(2)
     with risk_col:
@@ -2193,29 +2202,39 @@ def main() -> None:
             default=["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL"],
         )
 
-    allowed_strategy_labels = st.multiselect(
-        "Allowed Strategies",
-        list(STRATEGY_LABELS.values()),
-        default=list(STRATEGY_LABELS.values()),
-    )
+    if setup_mode == "Advanced":
+        allowed_strategy_labels = st.multiselect(
+            "Allowed Strategies",
+            list(STRATEGY_LABELS.values()),
+            default=list(STRATEGY_LABELS.values()),
+        )
+    else:
+        allowed_strategy_labels = list(STRATEGY_LABELS.values())
+        st.caption("Basic mode uses all strategies by default.")
 
     strategy_reverse = {v: k for k, v in STRATEGY_LABELS.items()}
     allowed_strategies = [strategy_reverse[label] for label in allowed_strategy_labels]
 
-    st.markdown("Shares owned per ticker (for covered calls)")
-    shares_default = pd.DataFrame({"Ticker": tickers, "SharesOwned": [0] * len(tickers)})
-    shares_df = st.data_editor(
-        shares_default,
-        hide_index=True,
-        use_container_width=True,
-        num_rows="fixed",
-    )
-    shares_map = {row["Ticker"]: int(row["SharesOwned"]) for _, row in shares_df.iterrows()}
+    if setup_mode == "Advanced":
+        st.markdown("Shares owned per ticker (for covered calls)")
+        shares_default = pd.DataFrame({"Ticker": tickers, "SharesOwned": [0] * len(tickers)})
+        shares_df = st.data_editor(
+            shares_default,
+            hide_index=True,
+            use_container_width=True,
+            num_rows="fixed",
+        )
+        shares_map = {row["Ticker"]: int(row["SharesOwned"]) for _, row in shares_df.iterrows()}
+    else:
+        shares_map = {ticker: 0 for ticker in tickers}
 
     default_risk = 1.0 if risk_level == "conservative" else 2.0
     risk_size_col, csp_col, call_col = st.columns(3)
     with risk_size_col:
-        max_risk_per_trade_pct = st.slider("Max Risk Per Trade (%)", 0.25, 5.0, float(default_risk), 0.25)
+        if setup_mode == "Advanced":
+            max_risk_per_trade_pct = st.slider("Max Risk Per Trade (%)", 0.25, 5.0, float(default_risk), 0.25)
+        else:
+            max_risk_per_trade_pct = st.selectbox("Risk Budget (%)", [0.5, 1.0, 1.5, 2.0], index=1 if risk_level == "conservative" else 3)
     with csp_col:
         cash_per_trade = st.number_input(
             "Cash reserved per CSP trade ($)",
@@ -2233,29 +2252,37 @@ def main() -> None:
             step=50.0,
         )
 
-    st.markdown("Earnings Filter")
-    earn_col1, earn_col2 = st.columns(2)
-    with earn_col1:
-        use_earnings_filter = st.checkbox("Avoid trades around earnings", value=True)
-        avoid_if_before_expiry = st.checkbox("Avoid if earnings falls before option expiry", value=True)
-    with earn_col2:
-        earnings_buffer_days = st.slider("Earnings proximity window (days)", 3, 21, 7, 1)
+    if setup_mode == "Advanced":
+        st.markdown("Earnings Filter")
+        earn_col1, earn_col2 = st.columns(2)
+        with earn_col1:
+            use_earnings_filter = st.checkbox("Avoid trades around earnings", value=True)
+            avoid_if_before_expiry = st.checkbox("Avoid if earnings falls before option expiry", value=True)
+        with earn_col2:
+            earnings_buffer_days = st.slider("Earnings proximity window (days)", 3, 21, 7, 1)
 
-    st.markdown("Options Data Provider")
-    provider_col1, provider_col2 = st.columns(2)
-    with provider_col1:
-        options_provider = st.selectbox(
-            "Provider",
-            ["auto", "yahoo", "tradier"],
-            index=0,
-            help="Auto tries Yahoo first, then falls back to Tradier if available.",
-        )
-    with provider_col2:
-        tradier_token_input = st.text_input(
-            "Tradier Token (optional)",
-            type="password",
-            help="Used when Provider is set to tradier. You can also store TRADIER_TOKEN in Streamlit secrets.",
-        )
+        st.markdown("Options Data Provider")
+        provider_col1, provider_col2 = st.columns(2)
+        with provider_col1:
+            options_provider = st.selectbox(
+                "Provider",
+                ["auto", "yahoo", "tradier"],
+                index=0,
+                help="Auto tries Yahoo first, then falls back to Tradier if available.",
+            )
+        with provider_col2:
+            tradier_token_input = st.text_input(
+                "Tradier Token (optional)",
+                type="password",
+                help="Used when Provider is set to tradier. You can also store TRADIER_TOKEN in Streamlit secrets.",
+            )
+    else:
+        use_earnings_filter = True
+        avoid_if_before_expiry = True
+        earnings_buffer_days = 7
+        options_provider = "auto"
+        tradier_token_input = ""
+        st.caption("Basic defaults: earnings filter ON, provider AUTO, standard guardrails.")
 
     tradier_token = tradier_token_input.strip()
     if not tradier_token:
@@ -2264,14 +2291,19 @@ def main() -> None:
         except Exception:
             tradier_token = ""
 
-    st.markdown("Liquidity Filters")
-    liq_col1, liq_col2, liq_col3 = st.columns(3)
-    with liq_col1:
-        min_oi = st.number_input("Min Open Interest", min_value=0, max_value=50000, value=50, step=10)
-    with liq_col2:
-        min_volume = st.number_input("Min Option Volume", min_value=0, max_value=50000, value=10, step=5)
-    with liq_col3:
-        max_spread_pct = st.slider("Max Bid-Ask Spread %", min_value=1.0, max_value=35.0, value=15.0, step=0.5)
+    if setup_mode == "Advanced":
+        st.markdown("Liquidity Filters")
+        liq_col1, liq_col2, liq_col3 = st.columns(3)
+        with liq_col1:
+            min_oi = st.number_input("Min Open Interest", min_value=0, max_value=50000, value=50, step=10)
+        with liq_col2:
+            min_volume = st.number_input("Min Option Volume", min_value=0, max_value=50000, value=10, step=5)
+        with liq_col3:
+            max_spread_pct = st.slider("Max Bid-Ask Spread %", min_value=1.0, max_value=35.0, value=15.0, step=0.5)
+    else:
+        min_oi = 50
+        min_volume = 10
+        max_spread_pct = 15.0
 
     if not tickers:
         st.info("Select at least one ticker.")
@@ -2301,7 +2333,7 @@ def main() -> None:
     if "lifecycle_rows" not in st.session_state:
         st.session_state.lifecycle_rows = []
 
-    if st.button("Analyze and Generate Next-Day Trades", type="primary"):
+    def run_analysis() -> bool:
         ideas: List[CandidateTrade] = []
         skipped: Dict[str, str] = {}
         rate_limited = False
@@ -2364,6 +2396,24 @@ def main() -> None:
             "next_day": str(next_day),
         }
         st.session_state.ai_memos = {}
+        return True
+
+    analyze_clicked = False
+    if setup_mode == "Basic":
+        a_col1, a_col2 = st.columns(2)
+        with a_col1:
+            if st.button("Quick Run", type="primary", key="quick_run_btn"):
+                analyze_clicked = True
+        with a_col2:
+            if st.button("Analyze and Generate Next-Day Trades", key="analyze_btn_basic"):
+                analyze_clicked = True
+        st.caption("Quick Run uses Basic defaults and launches analysis in one tap.")
+    else:
+        if st.button("Analyze and Generate Next-Day Trades", type="primary", key="analyze_btn_advanced"):
+            analyze_clicked = True
+
+    if analyze_clicked:
+        run_analysis()
 
     payload = st.session_state.analysis_payload
     if not payload:
